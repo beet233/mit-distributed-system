@@ -172,6 +172,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term >= rf.currentTerm {
 		if args.Term > rf.currentTerm {
 			rf.currentTerm = args.Term
+			rf.votedFor = -1
 			rf.status = "follower"
 		}
 		// TODO: guarantee if i am candidate or leader, do not vote
@@ -237,6 +238,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	DPrintf("server %d receive heartbeat from %d\n", rf.me, args.LeaderId)
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+		rf.votedFor = -1
 		rf.status = "follower"
 	}
 	rf.electionCurrentTime = 0
@@ -333,6 +335,7 @@ func (rf *Raft) ticker() {
 func (rf *Raft) election() {
 	rf.status = "candidate"
 	rf.currentTerm++
+	rf.votedFor = rf.me
 	var args RequestVoteArgs
 	args = RequestVoteArgs{rf.currentTerm, rf.me}
 	voteSum := 0

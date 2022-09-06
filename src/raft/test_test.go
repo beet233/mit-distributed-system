@@ -61,18 +61,24 @@ func TestReElection2A(t *testing.T) {
 	leader1 := cfg.checkOneLeader()
 
 	// if the leader disconnects, a new one should be elected.
+	// TODO: after disconnect leader1, can't get new leader
+	DPrintf("disconnect server %d\n", leader1)
 	cfg.disconnect(leader1)
+	// 两个节点想要一个新 leader，那只能是等他们的term不断增加直到差一，才能有一个时刻某个节点还没把票投给自己，两张票都给一个节点，得到新 leader
 	cfg.checkOneLeader()
 
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader. and the old leader
 	// should switch to follower.
+	DPrintf("connect server %d\n", leader1)
 	cfg.connect(leader1)
 	leader2 := cfg.checkOneLeader()
 
 	// if there's no quorum, no new leader should
 	// be elected.
+	DPrintf("disconnect server %d\n", leader2)
 	cfg.disconnect(leader2)
+	DPrintf("disconnect server %d\n", (leader2+1)%servers)
 	cfg.disconnect((leader2 + 1) % servers)
 	time.Sleep(2 * RaftElectionTimeout)
 
