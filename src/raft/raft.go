@@ -70,7 +70,9 @@ type Raft struct {
 	votedFor            int
 
 	// follower | candidate | leader
-	status string
+	status                  string
+	voteSum                 int
+	requestVoteReplyChannel chan RequestVoteReply
 }
 
 // return currentTerm and whether this server
@@ -174,6 +176,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
 			rf.status = "follower"
+			DPrintf("server %d become follower for term update\n", rf.me)
 		}
 		// TODO: guarantee if i am candidate or leader, do not vote
 		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
@@ -219,6 +222,30 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendRequestVoteWithChannelReply(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+	// 失败的就不传回 channel 了
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if ok {
+		rf.requestVoteReplyChannel <- *reply
+	}
+}
+
+func (rf *Raft) requestVoteReplyConsumer() {
+	for {
+		reply := <-rf.requestVoteReplyChannel
+		DPrintf("server %d get requestVoteReply\n", rf.me)
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.status = "follower"
+			DPrintf("server %d become follower for term update\n", rf.me)
+		}
+		if reply.VoteGranted {
+			DPrintf("server %d get vote from other server\n", rf.me)
+			rf.voteSum++
+		}
+	}
+}
+
 type LogEntry struct {
 }
 
@@ -240,6 +267,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.status = "follower"
+		DPrintf("server %d become follower for term update\n", rf.me)
 	}
 	rf.electionCurrentTime = 0
 	if rf.status == "candidate" {
@@ -311,14 +339,11 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) ticker() {
 	// election timeout: 150ms - 300ms
 	rf.electionDuration = 150 + rand.Intn(150)
-	for rf.killed() == false {
+	for rf.killed() == false && rf.status != "leader" {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		if rf.status == "leader" {
-			break
-		}
 		time.Sleep(time.Millisecond)
 		rf.electionCurrentTime++
 		if rf.electionCurrentTime >= rf.electionDuration {
@@ -328,41 +353,33 @@ func (rf *Raft) ticker() {
 			rf.electionCurrentTime = 0
 			go rf.election()
 		}
+		if rf.voteSum > len(rf.peers)/2 && rf.status == "candidate" {
+			DPrintf("server %d get %d votes, len(rf.peers)/2 = %d, rf.status = \"%s\"\n", rf.me, rf.voteSum, len(rf.peers)/2, rf.status)
+			DPrintf("server %d now become leader\n", rf.me)
+			rf.status = "leader"
+			// go a task to send heartbeats
+			go rf.heartbeat()
+		}
 	}
 }
 
+// failed 掉的请求会一直卡在那里，应该改成如果收到回复，给voteSum++，在一个定时任务如ticker里监控voteSum，如果超过半数就转换，在成为新的candidate并term增加时清空voteSum
+// 搞一个 channel 来接收返回，rpc 请求直接 go 出去
 // The election process as candidate
 func (rf *Raft) election() {
 	rf.status = "candidate"
 	rf.currentTerm++
+	rf.voteSum = 0
 	rf.votedFor = rf.me
 	var args RequestVoteArgs
 	args = RequestVoteArgs{rf.currentTerm, rf.me}
-	voteSum := 0
-	// TODO: parallel
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
-			voteSum++
+			rf.voteSum++
 			continue
 		}
 		var reply RequestVoteReply
-		ok := rf.sendRequestVote(i, &args, &reply)
-		if ok {
-			if args.Term > rf.currentTerm {
-				rf.currentTerm = args.Term
-				rf.status = "follower"
-			}
-		}
-		if ok && reply.VoteGranted {
-			DPrintf("server %d get vote from server %d\n", rf.me, i)
-			voteSum++
-		}
-	}
-	if voteSum > len(rf.peers)/2 && rf.status == "candidate" {
-		DPrintf("server %d now become leader\n", rf.me)
-		rf.status = "leader"
-		// go a task to send heartbeats
-		go rf.heartbeat()
+		go rf.sendRequestVoteWithChannelReply(i, &args, &reply)
 	}
 }
 
@@ -381,9 +398,10 @@ func (rf *Raft) heartbeat() {
 			DPrintf("server %d send out heartbeat to %d\n", rf.me, i)
 			ok := rf.sendAppendEntries(i, &args, &reply)
 			if ok {
-				if args.Term > rf.currentTerm {
-					rf.currentTerm = args.Term
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
 					rf.status = "follower"
+					DPrintf("server %d become follower for term update\n", rf.me)
 				}
 			}
 		}
@@ -412,6 +430,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.status = "follower"
 	rf.votedFor = -1
+	// give it a 10 size buffer, try to prevent slow consuming impact
+	rf.requestVoteReplyChannel = make(chan RequestVoteReply, 10)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -419,6 +439,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	DPrintf("server %d start to ticker as %s\n", me, rf.status)
+
+	go rf.requestVoteReplyConsumer()
 
 	return rf
 }
