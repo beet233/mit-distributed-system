@@ -70,9 +70,10 @@ type Raft struct {
 	votedFor            int
 
 	// follower | candidate | leader
-	status                  string
-	voteSum                 int
-	requestVoteReplyChannel chan RequestVoteReply
+	status                    string
+	voteSum                   int
+	requestVoteReplyChannel   chan RequestVoteReply
+	appendEntriesReplyChannel chan AppendEntriesReply
 }
 
 // return currentTerm and whether this server
@@ -183,6 +184,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			// TODO: if candidate's log is at least as up-to-date as mine, then grant vote
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
+			DPrintf("server %d vote for server %d\n", rf.me, args.CandidateId)
 		}
 	}
 	reply.Term = rf.currentTerm
@@ -289,6 +291,25 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func (rf *Raft) sendAppendEntriesWithChannelReply(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if ok {
+		rf.appendEntriesReplyChannel <- *reply
+	}
+}
+
+func (rf *Raft) appendEntriesReplyConsumer() {
+	for {
+		reply := <-rf.appendEntriesReplyChannel
+		DPrintf("server %d get appendEntriesReply\n", rf.me)
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.status = "follower"
+			DPrintf("server %d become follower for term update\n", rf.me)
+		}
+	}
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -389,21 +410,14 @@ func (rf *Raft) heartbeat() {
 	for rf.status == "leader" {
 		var args AppendEntriesArgs
 		args = AppendEntriesArgs{rf.currentTerm, rf.me, nil}
-		// TODO: parallel
+		// TODO: change to go/channel mode like vote
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
 			}
 			var reply AppendEntriesReply
 			DPrintf("server %d send out heartbeat to %d\n", rf.me, i)
-			ok := rf.sendAppendEntries(i, &args, &reply)
-			if ok {
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.status = "follower"
-					DPrintf("server %d become follower for term update\n", rf.me)
-				}
-			}
+			go rf.sendAppendEntriesWithChannelReply(i, &args, &reply)
 		}
 		time.Sleep(time.Millisecond * 40)
 	}
@@ -441,6 +455,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	DPrintf("server %d start to ticker as %s\n", me, rf.status)
 
 	go rf.requestVoteReplyConsumer()
+	go rf.appendEntriesReplyConsumer()
 
 	return rf
 }
