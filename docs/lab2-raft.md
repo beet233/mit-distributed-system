@@ -106,6 +106,12 @@ func (rf *Raft) requestVoteReplyConsumer() {
 
 注意维护 votedFor，已经投过票了的不能再投。
 
+TODO: Fix race, add lock.
+
+TODO: Write a graceful script for multiple times tests, watching if there are accidental failures.
+
+[Debugging by Pretty Printing (josejg.com)](https://blog.josejg.com/debugging-pretty/)
+
 ## Part 2B - log
 
 ## Part 2C - persistence
