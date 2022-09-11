@@ -14,6 +14,33 @@
 
 > 某服务调用 `Make(peers,me,…)` 来创造一个 Raft peer，peers 参数是 Raft peers 们的网络标识符数组（包括 me），`me` 参数是 peers 中当前 peer 的 index。`Start(command)` 让 Raft 开始处理一个 command，并加进它的复制 log 中。而 `Start()` 应该立刻返回，毕竟没有 log 嘛。服务希望当一个 log 被 commit 了后，通过 `applyCh` 这个 channel 发一条 `ApplyMsg ` 给它，这个 `applyCh` 是在 `Make` 中注册进去的。
 
+## 反复测试脚本
+
+A graceful script for multiple times tests, watching if there are accidental failures.
+
+[Debugging by Pretty Printing (josejg.com)](https://blog.josejg.com/debugging-pretty/)
+
+```shell
+#!/usr/bin/env bash
+
+trap 'exit 1' INT
+
+echo "Running test $1 for $2 iters"
+for i in $(seq 1 $2); do
+	# -n do not output the trailing newline
+	# -e enable interpretation of backslash escapes
+    echo -ne "\r$i / $2\r"
+    LOG="$1_$i.txt"
+    # Failed go test return nonzero exit codes
+    go test -run $1 &> $LOG
+    if [[ $? -eq 0 ]]; then
+        rm $LOG
+    else
+        echo "Failed at iter $i, saving log at $LOG"
+    fi
+done
+```
+
 ## Part 2A - leader election
 
 ### Task
@@ -106,36 +133,40 @@ func (rf *Raft) requestVoteReplyConsumer() {
 
 注意维护 votedFor，已经投过票了的不能再投。
 
-TODO: Fix race, add lock.
+### 偶发性 bug
 
-TODO: Write a graceful script for multiple times tests, watching if there are accidental failures.
+#### 某 server 成为 candidate 后，更新了另一个 server 的 term，还没成为 leader 发出心跳，另一个 server 也成为了 candidate，任期又递增
 
-```shell
-#!/usr/bin/env bash
+我认为在这种情况下，第一个 term 应该空缺，第二个 term 的 server 成为 leader，而程序出现 bug 的原因在于：
 
-trap 'exit 1' INT
-
-echo "Running test $1 for $2 iters"
-for i in $(seq 1 $2); do
-	# -n do not output the trailing newline
-	# -e enable interpretation of backslash escapes
-    echo -ne "\r$i / $2\r"
-    LOG="$1_$i.txt"
-    # Failed go test return nonzero exit codes
-    go test -run $1 &> $LOG
-    if [[ $? -eq 0 ]]; then
-        rm $LOG
-    else
-        echo "Failed at iter $i, saving log at $LOG"
-    fi
-done
+```
+2022/09/11 00:09:13                 server 2 get requestVoteReply
+2022/09/11 00:09:13 server 0 now become candidate // server 0 自己开启了 term 2
+2022/09/11 00:09:13                 server 2 get 2 votes, len(rf.peers)/2 = 1, rf.status = "candidate"
+2022/09/11 00:09:13                 server 2 get vote from other server
+2022/09/11 00:09:13         server 1 become follower for term update
+2022/09/11 00:09:13         server 1 vote for server 0
+2022/09/11 00:09:13 server 0 get requestVoteReply
+2022/09/11 00:09:13                 server 2 become follower for term update
+2022/09/11 00:09:13                 server 2 now become leader
 ```
 
+其中，`server 2 get 2 votes, len(rf.peers)/2 = 1, rf.status = "candidate"` 和 `server 2 now become leader` 在代码里是连在一起打印的，但我们发现在这期间，server 2 因 server 0 的 rpc 被变成了 follower，所以这里直接跳跃变成 leader 是不合法的操作，需要上锁。
 
+也许我们需要对判断和改变一起操作的 part 都进行一个上锁，并记着哪些改变前需要判断自己的状况。
 
-[Debugging by Pretty Printing (josejg.com)](https://blog.josejg.com/debugging-pretty/)
+#### 某 server 经历了奇怪的事，成为 leader 后挂了，之后复活。从 leader 变回 follower 后，没为它重新开启 ticker()
 
-![image-20220908232028390](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/image-20220908232028390.png)
+在变回 follower 的时候加个判断，如果是从 leader 变回来的就加个 ticker。
+
+### TODOs
+
++ ![image-20220908232028390](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/image-20220908232028390.png)
+
++ fix race，consider atomic variables. （done）
+  目前的加锁思路是对更新了 term 和 status 的操作整块上锁，让身份发生重大变化的地方一次性完成而不中途变更 term 和 status，也就是先优先保证正确性。
+  另外，通过一些重点变量的 getter 和 setter 单独加锁，解决 race。
+  [(15条消息) Golang同步：原子操作使用_巴途Adolph的博客-CSDN博客_golang原子操作](https://blog.csdn.net/liuxinmingcode/article/details/50095615#:~:text=GO语言提供的原子操作都是非入侵式的，由标准库sync%2Fatomic中的众多函数代表,类型包括int32%2Cint64%2Cuint32%2Cuint64%2Cuintptr%2Cunsafe.Pointer，共六个。)
 
 ## Part 2B - log
 

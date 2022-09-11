@@ -87,10 +87,12 @@ func TestReElection2A(t *testing.T) {
 	cfg.checkNoLeader()
 
 	// if a quorum arises, it should elect a leader.
+	DPrintf("connect server %d\n", (leader2+1)%servers)
 	cfg.connect((leader2 + 1) % servers)
 	cfg.checkOneLeader()
 
 	// re-join of last node shouldn't prevent leader from existing.
+	DPrintf("connect server %d\n", leader2)
 	cfg.connect(leader2)
 	cfg.checkOneLeader()
 
@@ -112,16 +114,22 @@ func TestManyElections2A(t *testing.T) {
 		i1 := rand.Int() % servers
 		i2 := rand.Int() % servers
 		i3 := rand.Int() % servers
+		DPrintf("disconnect server %d\n", i1)
 		cfg.disconnect(i1)
+		DPrintf("disconnect server %d\n", i2)
 		cfg.disconnect(i2)
+		DPrintf("disconnect server %d\n", i3)
 		cfg.disconnect(i3)
 
 		// either the current leader should still be alive,
 		// or the remaining four should elect a new one.
 		cfg.checkOneLeader()
 
+		DPrintf("connect server %d\n", i1)
 		cfg.connect(i1)
+		DPrintf("connect server %d\n", i2)
 		cfg.connect(i2)
+		DPrintf("connect server %d\n", i3)
 		cfg.connect(i3)
 	}
 

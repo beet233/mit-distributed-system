@@ -64,16 +64,30 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	electionCurrentTime int
-	electionDuration    int
-	currentTerm         int
+	electionCurrentTime int32
+	electionDuration    int32
+	currentTerm         int32
 	votedFor            int
 
 	// follower | candidate | leader
 	status                    string
-	voteSum                   int
+	statusMutex               sync.Mutex
+	voteSum                   int32
 	requestVoteReplyChannel   chan RequestVoteReply
 	appendEntriesReplyChannel chan AppendEntriesReply
+}
+
+func (rf *Raft) SetStatus(status string) {
+	rf.statusMutex.Lock()
+	rf.status = status
+	rf.statusMutex.Unlock()
+}
+
+func (rf *Raft) GetStatus() string {
+	rf.statusMutex.Lock()
+	result := rf.status
+	rf.statusMutex.Unlock()
+	return result
 }
 
 // return currentTerm and whether this server
@@ -83,8 +97,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	term = rf.currentTerm
-	isleader = rf.status == "leader"
+	term = int(atomic.LoadInt32(&rf.currentTerm))
+	isleader = rf.GetStatus() == "leader"
 	return term, isleader
 }
 
@@ -152,7 +166,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int
+	Term        int32
 	CandidateId int
 }
 
@@ -162,7 +176,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int
+	Term        int32
 	VoteGranted bool
 }
 
@@ -172,13 +186,19 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	reply.VoteGranted = false
-	if args.Term >= rf.currentTerm {
-		if args.Term > rf.currentTerm {
-			rf.currentTerm = args.Term
+	if args.Term >= atomic.LoadInt32(&rf.currentTerm) {
+		rf.mu.Lock()
+		if args.Term > atomic.LoadInt32(&rf.currentTerm) {
+			atomic.StoreInt32(&rf.currentTerm, args.Term)
 			rf.votedFor = -1
-			rf.status = "follower"
+			originStatus := rf.GetStatus()
+			rf.SetStatus("follower")
+			if originStatus == "leader" {
+				go rf.ticker()
+			}
 			DPrintf("server %d become follower for term update\n", rf.me)
 		}
+		rf.mu.Unlock()
 		// TODO: guarantee if i am candidate or leader, do not vote
 		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 			// TODO: if candidate's log is at least as up-to-date as mine, then grant vote
@@ -187,7 +207,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			DPrintf("server %d vote for server %d\n", rf.me, args.CandidateId)
 		}
 	}
-	reply.Term = rf.currentTerm
+	reply.Term = atomic.LoadInt32(&rf.currentTerm)
 }
 
 //
@@ -236,14 +256,20 @@ func (rf *Raft) requestVoteReplyConsumer() {
 	for {
 		reply := <-rf.requestVoteReplyChannel
 		DPrintf("server %d get requestVoteReply\n", rf.me)
-		if reply.Term > rf.currentTerm {
-			rf.currentTerm = reply.Term
-			rf.status = "follower"
+		rf.mu.Lock()
+		if reply.Term > atomic.LoadInt32(&rf.currentTerm) {
+			atomic.StoreInt32(&rf.currentTerm, reply.Term)
+			originStatus := rf.GetStatus()
+			rf.SetStatus("follower")
+			if originStatus == "leader" {
+				go rf.ticker()
+			}
 			DPrintf("server %d become follower for term update\n", rf.me)
 		}
+		rf.mu.Unlock()
 		if reply.VoteGranted {
 			DPrintf("server %d get vote from other server\n", rf.me)
-			rf.voteSum++
+			atomic.AddInt32(&rf.voteSum, 1)
 		}
 	}
 }
@@ -252,32 +278,40 @@ type LogEntry struct {
 }
 
 type AppendEntriesArgs struct {
-	Term     int
+	Term     int32
 	LeaderId int
 	Entries  []LogEntry
 }
 
 type AppendEntriesReply struct {
-	Term    int
+	Term    int32
 	Success bool
 }
 
 // AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	DPrintf("server %d receive heartbeat from %d\n", rf.me, args.LeaderId)
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
+	rf.mu.Lock()
+	if args.Term > atomic.LoadInt32(&rf.currentTerm) {
+		atomic.StoreInt32(&rf.currentTerm, args.Term)
 		rf.votedFor = -1
-		rf.status = "follower"
+		originStatus := rf.GetStatus()
+		rf.SetStatus("follower")
+		if originStatus == "leader" {
+			go rf.ticker()
+		}
 		DPrintf("server %d become follower for term update\n", rf.me)
 	}
-	rf.electionCurrentTime = 0
-	if rf.status == "candidate" {
-		rf.status = "follower"
+	rf.mu.Unlock()
+	atomic.StoreInt32(&rf.electionCurrentTime, 0)
+	rf.mu.Lock()
+	if rf.GetStatus() == "candidate" {
+		rf.SetStatus("follower")
 		DPrintf("server %d turn into follower from candidate\n", rf.me)
 	}
+	rf.mu.Unlock()
 	reply.Success = true
-	if args.Term < rf.currentTerm {
+	if args.Term < atomic.LoadInt32(&rf.currentTerm) {
 		reply.Success = false
 		return
 	}
@@ -302,11 +336,17 @@ func (rf *Raft) appendEntriesReplyConsumer() {
 	for {
 		reply := <-rf.appendEntriesReplyChannel
 		DPrintf("server %d get appendEntriesReply\n", rf.me)
-		if reply.Term > rf.currentTerm {
-			rf.currentTerm = reply.Term
-			rf.status = "follower"
+		rf.mu.Lock()
+		if reply.Term > atomic.LoadInt32(&rf.currentTerm) {
+			atomic.StoreInt32(&rf.currentTerm, reply.Term)
+			originStatus := rf.GetStatus()
+			rf.SetStatus("follower")
+			if originStatus == "leader" {
+				go rf.ticker()
+			}
 			DPrintf("server %d become follower for term update\n", rf.me)
 		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -359,28 +399,30 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	// election timeout: 150ms - 300ms
-	rf.electionDuration = 150 + rand.Intn(150)
-	for rf.killed() == false && rf.status != "leader" {
+	rf.electionDuration = 150 + rand.Int31n(150)
+	for rf.killed() == false && rf.GetStatus() != "leader" {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		time.Sleep(time.Millisecond)
-		rf.electionCurrentTime++
-		if rf.electionCurrentTime >= rf.electionDuration {
+		atomic.AddInt32(&rf.electionCurrentTime, 1)
+		if atomic.LoadInt32(&rf.electionCurrentTime) >= rf.electionDuration {
 			// kick off a new election
 			DPrintf("server %d election timeout!\n", rf.me)
 			DPrintf("server %d now become candidate\n", rf.me)
-			rf.electionCurrentTime = 0
+			atomic.StoreInt32(&rf.electionCurrentTime, 0)
 			go rf.election()
 		}
-		if rf.voteSum > len(rf.peers)/2 && rf.status == "candidate" {
-			DPrintf("server %d get %d votes, len(rf.peers)/2 = %d, rf.status = \"%s\"\n", rf.me, rf.voteSum, len(rf.peers)/2, rf.status)
+		rf.mu.Lock()
+		if atomic.LoadInt32(&rf.voteSum) > int32(len(rf.peers)/2) && rf.GetStatus() == "candidate" {
+			DPrintf("server %d get %d votes, len(rf.peers)/2 = %d, rf.status = \"%s\"\n", rf.me, atomic.LoadInt32(&rf.voteSum), len(rf.peers)/2, rf.GetStatus())
 			DPrintf("server %d now become leader\n", rf.me)
-			rf.status = "leader"
+			rf.SetStatus("leader")
 			// go a task to send heartbeats
 			go rf.heartbeat()
 		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -388,38 +430,47 @@ func (rf *Raft) ticker() {
 // 搞一个 channel 来接收返回，rpc 请求直接 go 出去
 // The election process as candidate
 func (rf *Raft) election() {
-	rf.status = "candidate"
-	rf.currentTerm++
-	rf.voteSum = 0
+	// 简单起见，发选举请求期间你就别换任期和身份了
+	rf.mu.Lock()
+	rf.SetStatus("candidate")
+	atomic.AddInt32(&rf.currentTerm, 1)
+	atomic.StoreInt32(&rf.voteSum, 0)
 	rf.votedFor = rf.me
 	var args RequestVoteArgs
-	args = RequestVoteArgs{rf.currentTerm, rf.me}
+	args = RequestVoteArgs{atomic.LoadInt32(&rf.currentTerm), rf.me}
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
-			rf.voteSum++
+			atomic.AddInt32(&rf.voteSum, 1)
 			continue
 		}
 		var reply RequestVoteReply
 		go rf.sendRequestVoteWithChannelReply(i, &args, &reply)
 	}
+	rf.mu.Unlock()
 }
 
 // leader sending heartbeats task
 func (rf *Raft) heartbeat() {
 	DPrintf("server %d start giving heartbeats\n", rf.me)
-	for rf.status == "leader" {
-		var args AppendEntriesArgs
-		args = AppendEntriesArgs{rf.currentTerm, rf.me, nil}
-		// TODO: change to go/channel mode like vote
-		for i := 0; i < len(rf.peers); i++ {
-			if i == rf.me {
-				continue
+	for rf.GetStatus() == "leader" {
+		rf.mu.Lock()
+		// 这里是防止后期这个leader被复活后，更新了 term 还没更新 status，却在这发 heartbeat，那就成了错误的 leader 了
+		// 在服务器复活的地方（被其他 rpc 更新 term 和变成 follower 的地方），我都做了上锁，所以这两个不会串起来
+		if rf.GetStatus() == "leader" {
+			var args AppendEntriesArgs
+			args = AppendEntriesArgs{atomic.LoadInt32(&rf.currentTerm), rf.me, nil}
+			// TODO: change to go/channel mode like vote
+			for i := 0; i < len(rf.peers); i++ {
+				if i == rf.me {
+					continue
+				}
+				var reply AppendEntriesReply
+				DPrintf("server %d send out heartbeat to %d\n", rf.me, i)
+				go rf.sendAppendEntriesWithChannelReply(i, &args, &reply)
 			}
-			var reply AppendEntriesReply
-			DPrintf("server %d send out heartbeat to %d\n", rf.me, i)
-			go rf.sendAppendEntriesWithChannelReply(i, &args, &reply)
+			time.Sleep(time.Millisecond * 40)
 		}
-		time.Sleep(time.Millisecond * 40)
+		rf.mu.Unlock()
 	}
 }
 
@@ -442,7 +493,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.status = "follower"
+	rf.SetStatus("follower")
 	rf.votedFor = -1
 	// give it a 10 size buffer, try to prevent slow consuming impact
 	rf.requestVoteReplyChannel = make(chan RequestVoteReply, 10)
@@ -452,7 +503,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	DPrintf("server %d start to ticker as %s\n", me, rf.status)
+	DPrintf("server %d start to ticker as %s\n", me, rf.GetStatus())
 
 	go rf.requestVoteReplyConsumer()
 	go rf.appendEntriesReplyConsumer()
