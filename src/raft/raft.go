@@ -7,10 +7,10 @@ package raft
 //
 // rf = Make(...)
 //   create a new Raft server.
-// rf.Start(command interface{}) (index, Term, isleader)
+// rf.Start(command interface{}) (index, term, isleader)
 //   start agreement on a new log entry
-// rf.GetState() (Term, isLeader)
-//   ask a Raft for its current Term, and whether it thinks it is leader
+// rf.GetState() (term, isLeader)
+//   ask a Raft for its current term, and whether it thinks it is leader
 // ApplyMsg
 //   each time a new entry is committed to the log, each Raft peer
 //   should send an ApplyMsg to the service (or tester)
@@ -18,18 +18,16 @@ package raft
 //
 
 import (
-	"math/rand"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
 
 //
-// as each Raft peer becomes aware that successive log Entries are
+// as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
 // CommandValid to true to indicate that the ApplyMsg contains a newly
@@ -51,11 +49,6 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-type LogEntry struct {
-	term    int32
-	command interface{}
-}
-
 //
 // A Go object implementing a single Raft peer.
 //
@@ -69,37 +62,7 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	electionCurrentTime int32
-	electionDuration    int32
-	currentTerm         int32
-	votedFor            int
 
-	// follower | candidate | leader
-	status                    string
-	statusMutex               sync.Mutex
-	voteSum                   int32
-	requestVoteReplyChannel   chan RequestVoteReply
-	appendEntriesReplyChannel chan AppendEntriesReply
-
-	// log
-	log         []LogEntry
-	commitIndex int
-	lastApplied int
-	nextIndex   []int
-	matchIndex  []int
-}
-
-func (rf *Raft) SetStatus(status string) {
-	rf.statusMutex.Lock()
-	rf.status = status
-	rf.statusMutex.Unlock()
-}
-
-func (rf *Raft) GetStatus() string {
-	rf.statusMutex.Lock()
-	result := rf.status
-	rf.statusMutex.Unlock()
-	return result
 }
 
 // return currentTerm and whether this server
@@ -109,8 +72,6 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	term = int(atomic.LoadInt32(&rf.currentTerm))
-	isleader = rf.GetStatus() == "leader"
 	return term, isleader
 }
 
@@ -178,10 +139,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term         int32
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int32
 }
 
 //
@@ -190,8 +147,6 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int32
-	VoteGranted bool
 }
 
 //
@@ -199,32 +154,6 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	reply.VoteGranted = false
-	if args.Term >= atomic.LoadInt32(&rf.currentTerm) {
-		rf.mu.Lock()
-		if args.Term > atomic.LoadInt32(&rf.currentTerm) {
-			atomic.StoreInt32(&rf.currentTerm, args.Term)
-			rf.votedFor = -1
-			originStatus := rf.GetStatus()
-			rf.SetStatus("follower")
-			if originStatus == "leader" {
-				go rf.ticker()
-			}
-			DPrintf("server %d become follower for term update\n", rf.me)
-		}
-		rf.mu.Unlock()
-		// guarantee if i am candidate or leader, do not vote
-		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-			// if candidate's log is at least as up-to-date as mine, then grant vote
-			if args.LastLogIndex <= len(rf.log)-1 && rf.log[args.LastLogTerm].term == args.LastLogTerm {
-				// 不一致就不给票，如果 candidate 并不是最新，它就不该赢
-				reply.VoteGranted = true
-				rf.votedFor = args.CandidateId
-				DPrintf("server %d vote for server %d\n", rf.me, args.CandidateId)
-			}
-		}
-	}
-	reply.Term = atomic.LoadInt32(&rf.currentTerm)
 }
 
 //
@@ -261,137 +190,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendRequestVoteWithChannelReply(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
-	// 失败的就不传回 channel 了
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	if ok {
-		rf.requestVoteReplyChannel <- *reply
-	}
-}
-
-func (rf *Raft) requestVoteReplyConsumer() {
-	for {
-		reply := <-rf.requestVoteReplyChannel
-		DPrintf("server %d get requestVoteReply\n", rf.me)
-		rf.mu.Lock()
-		if reply.Term > atomic.LoadInt32(&rf.currentTerm) {
-			atomic.StoreInt32(&rf.currentTerm, reply.Term)
-			originStatus := rf.GetStatus()
-			rf.SetStatus("follower")
-			if originStatus == "leader" {
-				go rf.ticker()
-			}
-			DPrintf("server %d become follower for term update\n", rf.me)
-		}
-		rf.mu.Unlock()
-		if reply.VoteGranted {
-			DPrintf("server %d get vote from other server\n", rf.me)
-			atomic.AddInt32(&rf.voteSum, 1)
-		}
-	}
-}
-
-type AppendEntriesArgs struct {
-	Term         int32
-	LeaderId     int
-	Entries      []LogEntry
-	PrevLogIndex int
-	PrevLogTerm  int32
-	LeaderCommit int
-}
-
-type AppendEntriesReply struct {
-	Term    int32
-	Success bool
-}
-
-// AppendEntries RPC handler
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	DPrintf("server %d receive heartbeat from %d\n", rf.me, args.LeaderId)
-	rf.mu.Lock()
-	if args.Term > atomic.LoadInt32(&rf.currentTerm) {
-		atomic.StoreInt32(&rf.currentTerm, args.Term)
-		rf.votedFor = -1
-		originStatus := rf.GetStatus()
-		rf.SetStatus("follower")
-		if originStatus == "leader" {
-			go rf.ticker()
-		}
-		DPrintf("server %d become follower for term update\n", rf.me)
-	}
-	rf.mu.Unlock()
-	atomic.StoreInt32(&rf.electionCurrentTime, 0)
-	rf.mu.Lock()
-	if rf.GetStatus() == "candidate" {
-		rf.SetStatus("follower")
-		DPrintf("server %d turn into follower from candidate\n", rf.me)
-	}
-	rf.mu.Unlock()
-	reply.Term = rf.currentTerm
-	reply.Success = true
-	if args.Term < atomic.LoadInt32(&rf.currentTerm) {
-		reply.Success = false
-		return
-	}
-	if args.Entries != nil {
-		// TODO: append log Entries
-		if args.PrevLogIndex > len(rf.log)-1 || rf.log[args.PrevLogIndex].term != args.PrevLogTerm {
-			reply.Success = false
-			return
-		}
-		for i := 0; i < len(args.Entries); i++ {
-			if len(rf.log) >= args.PrevLogIndex+i+2 && rf.log[args.PrevLogIndex+1+i] != args.Entries[i] {
-				// delete from the different index
-				rf.log = rf.log[:args.PrevLogIndex+1+i]
-			}
-			rf.log = append(rf.log, args.Entries[i])
-		}
-	}
-	if args.LeaderCommit > rf.commitIndex {
-		if args.LeaderCommit < len(rf.log)-1 {
-			rf.commitIndex = args.LeaderCommit
-		} else {
-			rf.commitIndex = len(rf.log) - 1
-		}
-		// 更新 commitIndex 时，apply 到状态机
-		if rf.commitIndex > rf.lastApplied {
-			rf.lastApplied++
-			// TODO: apply log[lastApplied] to state machine
-		}
-	}
-
-}
-
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
-}
-
-func (rf *Raft) sendAppendEntriesWithChannelReply(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if ok {
-		rf.appendEntriesReplyChannel <- *reply
-	}
-}
-
-func (rf *Raft) appendEntriesReplyConsumer() {
-	for {
-		reply := <-rf.appendEntriesReplyChannel
-		DPrintf("server %d get appendEntriesReply\n", rf.me)
-		rf.mu.Lock()
-		if reply.Term > atomic.LoadInt32(&rf.currentTerm) {
-			atomic.StoreInt32(&rf.currentTerm, reply.Term)
-			originStatus := rf.GetStatus()
-			rf.SetStatus("follower")
-			if originStatus == "leader" {
-				go rf.ticker()
-			}
-			DPrintf("server %d become follower for term update\n", rf.me)
-		}
-		rf.mu.Unlock()
-	}
-}
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -403,7 +201,7 @@ func (rf *Raft) appendEntriesReplyConsumer() {
 //
 // the first return value is the index that the command will appear at
 // if it's ever committed. the second return value is the current
-// Term. the third return value is true if this server believes it is
+// term. the third return value is true if this server believes it is
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -412,22 +210,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-	// TODO: 如果有并发度比较高的 command 怎么办？
-	// TODO: 暂时忽略这件事，因为 raft 好像本来就不是为高并发服务的
-	term32 := atomic.LoadInt32(&rf.currentTerm)
-	// 将 command 加入自己的 log
-	rf.log = append(rf.log, LogEntry{
-		term:    term32,
-		command: command,
-	})
-	// TODO: 将 command 发到每一个 server
-	// TODO: 一样的用 go 来依次发送，然后再 go 一个接收的线程
 
-	// TODO: 这里似乎要确认应用到状态机了再回复，可能需要一个相应的 server 计数循环
-
-	index = len(rf.log) - 1
-	term = int(term32)
-	isLeader = rf.status == "leader"
 	return index, term, isLeader
 }
 
@@ -455,78 +238,12 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	// election timeout: 150ms - 300ms
-	rf.electionDuration = 150 + rand.Int31n(150)
-	for rf.killed() == false && rf.GetStatus() != "leader" {
+	for rf.killed() == false {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		time.Sleep(time.Millisecond)
-		atomic.AddInt32(&rf.electionCurrentTime, 1)
-		if atomic.LoadInt32(&rf.electionCurrentTime) >= rf.electionDuration {
-			// kick off a new election
-			DPrintf("server %d election timeout!\n", rf.me)
-			DPrintf("server %d now become candidate\n", rf.me)
-			atomic.StoreInt32(&rf.electionCurrentTime, 0)
-			go rf.election()
-		}
-		rf.mu.Lock()
-		if atomic.LoadInt32(&rf.voteSum) > int32(len(rf.peers)/2) && rf.GetStatus() == "candidate" {
-			DPrintf("server %d get %d votes, len(rf.peers)/2 = %d, rf.status = \"%s\"\n", rf.me, atomic.LoadInt32(&rf.voteSum), len(rf.peers)/2, rf.GetStatus())
-			DPrintf("server %d now become leader\n", rf.me)
-			rf.SetStatus("leader")
-			// go a task to send heartbeats
-			go rf.heartbeat()
-		}
-		rf.mu.Unlock()
-	}
-}
 
-// failed 掉的请求会一直卡在那里，应该改成如果收到回复，给voteSum++，在一个定时任务如ticker里监控voteSum，如果超过半数就转换，在成为新的candidate并term增加时清空voteSum
-// 搞一个 channel 来接收返回，rpc 请求直接 go 出去
-// The election process as candidate
-func (rf *Raft) election() {
-	// 简单起见，发选举请求期间你就别换任期和身份了
-	rf.mu.Lock()
-	rf.SetStatus("candidate")
-	atomic.AddInt32(&rf.currentTerm, 1)
-	atomic.StoreInt32(&rf.voteSum, 0)
-	rf.votedFor = rf.me
-	var args RequestVoteArgs
-	args = RequestVoteArgs{atomic.LoadInt32(&rf.currentTerm), rf.me}
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			atomic.AddInt32(&rf.voteSum, 1)
-			continue
-		}
-		var reply RequestVoteReply
-		go rf.sendRequestVoteWithChannelReply(i, &args, &reply)
-	}
-	rf.mu.Unlock()
-}
-
-// leader sending heartbeats task
-func (rf *Raft) heartbeat() {
-	DPrintf("server %d start giving heartbeats\n", rf.me)
-	for rf.GetStatus() == "leader" {
-		rf.mu.Lock()
-		// 这里是防止后期这个leader被复活后，更新了 term 还没更新 status，却在这发 heartbeat，那就成了错误的 leader 了
-		// 在服务器复活的地方（被其他 rpc 更新 term 和变成 follower 的地方），我都做了上锁，所以这两个不会串起来
-		if rf.GetStatus() == "leader" {
-			var args AppendEntriesArgs
-			args = AppendEntriesArgs{atomic.LoadInt32(&rf.currentTerm), rf.me, nil}
-			for i := 0; i < len(rf.peers); i++ {
-				if i == rf.me {
-					continue
-				}
-				var reply AppendEntriesReply
-				DPrintf("server %d send out heartbeat to %d\n", rf.me, i)
-				go rf.sendAppendEntriesWithChannelReply(i, &args, &reply)
-			}
-			time.Sleep(time.Millisecond * 40)
-		}
-		rf.mu.Unlock()
 	}
 }
 
@@ -549,20 +266,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.SetStatus("follower")
-	rf.votedFor = -1
-	// give it a 10 size buffer, try to prevent slow consuming impact
-	rf.requestVoteReplyChannel = make(chan RequestVoteReply, 10)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	DPrintf("server %d start to ticker as %s\n", me, rf.GetStatus())
-
-	go rf.requestVoteReplyConsumer()
-	go rf.appendEntriesReplyConsumer()
 
 	return rf
 }
