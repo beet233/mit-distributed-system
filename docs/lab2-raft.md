@@ -170,6 +170,54 @@ func (rf *Raft) requestVoteReplyConsumer() {
 
 ## Part 2B - log
 
+基本思想就是 client 给 leader 发了一条指令，leader 广播给所有 server，收到过半的 server 复制成功的回复时，leader 将这条 log commit，并回复给 client。
+
+> 一旦创建该日志条目的 leader 将它复制到过半的节点上时（比如图 6 中的条目 7），该日志条目就会被提交。 同时，leader 日志中该日志条目之前的所有日志条目也都会被提交，包括由之前的其他 leader 创建的日志条目。5.4 节会讨论在 leader 变更之后应用该规则的一些细节，并证明这种提交的规则是安全的。leader 会追踪它所知道的要提交的最高索引，并将该索引包含在未来的 AppendEntries RPC 中（包括心跳），以便其他的节点可以发现这个索引。一旦一个 follower 知道了一个日志条目被提交了。它就会将该日志条目按日志顺序应用到自己的状态机中。
+> ————————————————
+> 版权声明：本文为CSDN博主「-Hedon」的原创文章，遵循CC 4.0 BY-SA版权协议，转载请附上原文出处链接及本声明。
+> 原文链接：https://blog.csdn.net/Hedon954/article/details/119186225
+
+Raft 会一直维护着以下的特性，这些特性也同时构成了图 3 中的日志匹配特性（Log Matching Property）：
+
++ 如果不同日志中的两个条目有着相同的索引和任期值，那么它们就存储着相同的命令
++ 如果不同日志中的两个条目有着相同的索引和任期值，那么他们之前的所有日志条目也都相同
+
+第一条特性源于这样一个事实，在给定的一个任期值和给定的一个日志索引中，一个 leader 最多创建一个日志条目，而且日志条目永远不会改变它们在日志中的位置。
+
+第二条特性是由 AppendEntries RPC 执行的一个简单的一致性检查所保证的。当 leader 发送一个 AppendEntries RPC 的时候，leader 会将前一个日志条目的索引位置 `PrevLogIndex` 和任期号 `PrevLogTerm` 包含在里面（紧邻最新的日志条目）。如果一个 follower 在它的日志中找不到包含相同索引位置和任期号的条目，那么它就会拒绝该新的日志条目。一致性检查就像一个归纳步骤：一开始空的日志状态肯定是满足日志匹配特性（Log Matching Property）的，然后一致性检查保证了日志扩展时的日志匹配特性。因此，当 AppendEntries RPC 返回成功时，leader 就知道 follower 的日志一定和自己相同（从第一个日志条目到最新条目）。
+
+
+
+在 Raft 算法中，leader 通过强制 follower 复制 leader 日志来解决日志不一致的问题。也就是说，follower 中跟 leader 冲突的日志条目会被 leader 的日志条目所覆盖。5.4 节会证明通过增加一个限制，这种方式就可以保证安全性。
+
+为了使 follower 的日志跟自己（leader）一致，leader 必须找到两者达成一致的最大的日志条目索引，删除 follower 日志中从那个索引之后的所有日志条目，并且将自己那个索引之后的所有日志条目发送给 follower。所有的这些操作都发生在 AppendEntries RPCs 的一致性检查的回复中。leader 维护着一个针对每一个 follower 的 nextIndex，这个 nextIndex 代表的就是 leader 要发送给 follower 的下一个日志条目的索引。当选出一个新的 leader 时，该 leader 将所有的 nextIndex 的值都初始化为自己最后一个日志条目的 index 加 1（图7 中的 11）。如果一个 follower 的日志跟 leader 的是不一致的，那么下一次的 AppendEntries RPC 的一致性检查就会失败。AppendEntries RPC 在被 follower 拒绝之后，leader 对 nextIndex 进行减 1，然后重试 AppendEntries RPC。最终 nextIndex 会在某个位置满足 leader 和 follower 在该位置及之前的日志是一致的，此时，AppendEntries RPC 就会成功，将 follower 跟 leader 冲突的日志条目全部删除然后追加 leader 中的日志条目（需要的话）。一旦 AppendEntries RPC 成功，follower 的日志就和 leader 的一致了，并且在该任期接下来的时间里都保持一致。
+
+全部追加的具体实现如下：我们发现 AppendEntries 可以携带多个 log  entris，那从 nextIndex 到末尾切片传入即可。
+
+![image-20220922224750384](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/image-20220922224750384.png)
+
+
+
+Raft 通过无限重试来处理 RequestVote 和 AppendEntries 的失败，如果崩溃的节点重启了，那么这些 RPC 就会被成功地完成。Raft 的 RPCs 都是幂等的，所以重复发送相同的 RPCs 不会对系统造成危害。实际情况下，一个 follower 如果接收了一个 AppendEntries 请求，但是这个请求里面的这些日志条目在它日志中已经有了，它就会直接忽略这个新的请求中的这些日志条目。
+
+
+
+这里有个疑问：如果某节点挂了很久，无限重试的请求岂不是越积越多？这个问题先就放着不考虑。因为我感觉如果像 AppendEntries 后续可以一个请求补全所有 entries 的话，重复发之前的请求是没有意义的，而且也很混乱。
+
+
+
+Raft 采用投票的方式来保证一个 candidate 只有拥有之前所有任期中已经提交的日志条目之后，才有可能赢得选举。一个 candidate 如果想要被选为 leader，那它就必须跟集群中超过半数的节点进行通信，这就意味这些节点中至少一个包含了所有已经提交的日志条目。如果 candidate 的日志至少跟过半的服务器节点一样新，那么它就一定包含了所有以及提交的日志条目，一旦有投票者自己的日志比 candidate 的还新，那么这个投票者就会拒绝该投票，该 candidate 也就不会赢得选举。对应 RequestVote RPC 中的这个：
+
+![image-20220922220958310](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/image-20220922220958310.png)
+
+
+
+leader 收到 client 的 command 后返回的全过程：
+
+![image-20220924201353097](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/image-20220924201353097.png)
+
+只要其他 follower 收到了（AppendEntries 的 reply 的 success 不为 false），后面就等它们自动 apply 就行，leader 这边就已经认为它们成功了，更新 nextIndex 和 matchIndex。如果超过半数的 server 都成功了，leader 更新 commitIndex，然后会因此触发 apply 到状态机，然后返回给 client 成功。
+
 ## Part 2C - persistence
 
 ## Part 2D - log compaction

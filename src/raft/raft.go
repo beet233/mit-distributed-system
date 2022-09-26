@@ -51,6 +51,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntry struct {
+	term    int32
+	command interface{}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -75,6 +80,13 @@ type Raft struct {
 	voteSum                   int32
 	requestVoteReplyChannel   chan RequestVoteReply
 	appendEntriesReplyChannel chan AppendEntriesReply
+
+	// log
+	log         []LogEntry
+	commitIndex int
+	lastApplied int
+	nextIndex   []int
+	matchIndex  []int
 }
 
 func (rf *Raft) SetStatus(status string) {
@@ -166,8 +178,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int32
-	CandidateId int
+	Term         int32
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int32
 }
 
 //
@@ -199,12 +213,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			DPrintf("server %d become follower for term update\n", rf.me)
 		}
 		rf.mu.Unlock()
-		// TODO: guarantee if i am candidate or leader, do not vote
+		// guarantee if i am candidate or leader, do not vote
 		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-			// TODO: if candidate's log is at least as up-to-date as mine, then grant vote
-			reply.VoteGranted = true
-			rf.votedFor = args.CandidateId
-			DPrintf("server %d vote for server %d\n", rf.me, args.CandidateId)
+			// if candidate's log is at least as up-to-date as mine, then grant vote
+			if args.LastLogIndex <= len(rf.log)-1 && rf.log[args.LastLogTerm].term == args.LastLogTerm {
+				// 不一致就不给票，如果 candidate 并不是最新，它就不该赢
+				reply.VoteGranted = true
+				rf.votedFor = args.CandidateId
+				DPrintf("server %d vote for server %d\n", rf.me, args.CandidateId)
+			}
 		}
 	}
 	reply.Term = atomic.LoadInt32(&rf.currentTerm)
@@ -274,13 +291,13 @@ func (rf *Raft) requestVoteReplyConsumer() {
 	}
 }
 
-type LogEntry struct {
-}
-
 type AppendEntriesArgs struct {
-	Term     int32
-	LeaderId int
-	Entries  []LogEntry
+	Term         int32
+	LeaderId     int
+	Entries      []LogEntry
+	PrevLogIndex int
+	PrevLogTerm  int32
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -310,6 +327,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("server %d turn into follower from candidate\n", rf.me)
 	}
 	rf.mu.Unlock()
+	reply.Term = rf.currentTerm
 	reply.Success = true
 	if args.Term < atomic.LoadInt32(&rf.currentTerm) {
 		reply.Success = false
@@ -317,7 +335,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if args.Entries != nil {
 		// TODO: append log Entries
+		if args.PrevLogIndex > len(rf.log)-1 || rf.log[args.PrevLogIndex].term != args.PrevLogTerm {
+			reply.Success = false
+			return
+		}
+		for i := 0; i < len(args.Entries); i++ {
+			if len(rf.log) >= args.PrevLogIndex+i+2 && rf.log[args.PrevLogIndex+1+i] != args.Entries[i] {
+				// delete from the different index
+				rf.log = rf.log[:args.PrevLogIndex+1+i]
+			}
+			rf.log = append(rf.log, args.Entries[i])
+		}
 	}
+	if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit < len(rf.log)-1 {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = len(rf.log) - 1
+		}
+		// 更新 commitIndex 时，apply 到状态机
+		if rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			// TODO: apply log[lastApplied] to state machine
+		}
+	}
+
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -370,7 +412,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	// TODO: 如果有并发度比较高的 command 怎么办？
+	// TODO: 暂时忽略这件事，因为 raft 好像本来就不是为高并发服务的
+	term32 := atomic.LoadInt32(&rf.currentTerm)
+	// 将 command 加入自己的 log
+	rf.log = append(rf.log, LogEntry{
+		term:    term32,
+		command: command,
+	})
+	// TODO: 将 command 发到每一个 server
+	// TODO: 一样的用 go 来依次发送，然后再 go 一个接收的线程
 
+	// TODO: 这里似乎要确认应用到状态机了再回复，可能需要一个相应的 server 计数循环
+
+	index = len(rf.log) - 1
+	term = int(term32)
+	isLeader = rf.status == "leader"
 	return index, term, isLeader
 }
 
@@ -459,7 +516,6 @@ func (rf *Raft) heartbeat() {
 		if rf.GetStatus() == "leader" {
 			var args AppendEntriesArgs
 			args = AppendEntriesArgs{atomic.LoadInt32(&rf.currentTerm), rf.me, nil}
-			// TODO: change to go/channel mode like vote
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
 					continue
