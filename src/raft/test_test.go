@@ -61,7 +61,6 @@ func TestReElection2A(t *testing.T) {
 	leader1 := cfg.checkOneLeader()
 
 	// if the leader disconnects, a new one should be elected.
-	// TODO: after disconnect leader1, can't get new leader
 	DPrintf("disconnect server %d\n", leader1)
 	cfg.disconnect(leader1)
 	// 两个节点想要一个新 leader，那只能是等他们的term不断增加直到差一，才能有一个时刻某个节点还没把票投给自己，两张票都给一个节点，得到新 leader
