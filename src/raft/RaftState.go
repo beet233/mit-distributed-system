@@ -1,11 +1,12 @@
 package raft
+
 import (
 	"github.com/sasha-s/go-deadlock"
 )
 
-//const candidateState int = 0
-//const leaderState int = 1
-//const followerState int = 2
+const candidateState int = 0
+const leaderState int = 1
+const followerState int = 2
 
 type RaftState struct {
 	state       int // state of this server, Candidate, Leader, Follower

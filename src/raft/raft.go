@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"log"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -62,7 +63,9 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	raftState *RaftState
 
+	// TODO: some log flags with wrapped log func
 }
 
 // return currentTerm and whether this server
@@ -247,6 +250,29 @@ func (rf *Raft) ticker() {
 	}
 }
 
+func (rf *Raft) mainLoop() {
+	for !rf.killed() {
+		// atomically read state
+		rf.raftState.rLock()
+		curState := rf.raftState.state
+		rf.raftState.rUnlock()
+		switch curState {
+		case leaderState:
+			rf.leaderMain()
+			break
+		case candidateState:
+			rf.doElection()
+			break
+		case followerState:
+			rf.followerMain()
+			break
+		default:
+			log.Fatalln("undefined raft state.")
+			break
+		}
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -266,12 +292,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	// TODO: init all status to follower
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	// go rf.ticker()
+	go rf.mainLoop()
 
 	return rf
 }
