@@ -24,7 +24,7 @@ import (
 	"time"
 
 	//	"bytes"
-	"sync"
+
 	"sync/atomic"
 
 	//	"6.824/labgob"
@@ -58,7 +58,7 @@ type ApplyMsg struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	// mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -81,6 +81,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.raftState.rLock()
+	term = rf.raftState.currentTerm
+	isleader = rf.raftState.isState(leaderState)
+	rf.raftState.rUnlock()
 	return term, isleader
 }
 
@@ -181,6 +185,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term        int
+	CandidateId int
 }
 
 //
@@ -189,6 +195,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -196,6 +204,24 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	reply.VoteGranted = false
+	rf.raftState.wLock()
+	if args.Term >= rf.raftState.currentTerm {
+		if args.Term > rf.raftState.currentTerm {
+			rf.electionLog("update term and become follower if needed\n")
+			rf.raftState.currentTerm = args.Term
+			rf.raftState.votedFor = -1
+			rf.raftState.state = followerState
+		}
+		if rf.raftState.votedFor == -1 || rf.raftState.votedFor == args.CandidateId {
+			// TODO: if candidate's log is at least as up-to-date as mine, then grant vote
+			rf.electionLog("vote for %d\n", args.CandidateId)
+			reply.VoteGranted = true
+			rf.raftState.votedFor = args.CandidateId
+		}
+	}
+	reply.Term = rf.raftState.currentTerm
+	rf.raftState.wUnlock()
 }
 
 //
@@ -227,10 +253,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
+// func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+// 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+// 	return ok
+// }
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -296,13 +322,78 @@ func (rf *Raft) leaderMain() {
 
 }
 
+// warpped reply for check and retry
+type WrappedRequestVoteReply struct {
+	ok    bool
+	from  int
+	args  RequestVoteArgs
+	reply RequestVoteReply
+}
+
+func (rf *Raft) sendRequestVoteToAll() {
+	grantedVoteSum := 1
+	rf.raftState.rLock()
+	thisTerm := rf.raftState.currentTerm
+	rf.raftState.rUnlock()
+	replyChannel := make(chan WrappedRequestVoteReply, 10)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.raftState.rLock()
+		args := RequestVoteArgs{rf.raftState.currentTerm, rf.me}
+		rf.raftState.rUnlock()
+		var reply RequestVoteReply
+		go rf.sendRequestVoteWithChannelReply(i, &args, &reply, replyChannel)
+	}
+	// process reply
+	for {
+		rf.raftState.rLock()
+		if rf.raftState.currentTerm > thisTerm || rf.raftState.state != candidateState {
+			rf.raftState.rUnlock()
+			break
+		}
+		rf.raftState.rUnlock()
+		reply := <-replyChannel
+		if reply.ok {
+			rf.electionLog("get reply from server %d\n", reply.from)
+			rf.raftState.wLock()
+			if reply.reply.Term > rf.raftState.currentTerm {
+				rf.raftState.currentTerm = reply.reply.Term
+				rf.raftState.state = followerState
+			}
+			rf.raftState.wUnlock()
+			if reply.reply.VoteGranted {
+				grantedVoteSum += 1
+				if grantedVoteSum > len(rf.peers)/2 {
+					rf.electionLog("become leader\n")
+					rf.raftState.wLock()
+					rf.raftState.state = leaderState
+					rf.raftState.wUnlock()
+				}
+			}
+		} else {
+			// retry
+			var retryReply RequestVoteReply
+			go rf.sendRequestVoteWithChannelReply(reply.from, &reply.args, &retryReply, replyChannel)
+		}
+	}
+}
+
+func (rf *Raft) sendRequestVoteWithChannelReply(to int, args *RequestVoteArgs, reply *RequestVoteReply, replyChannel chan WrappedRequestVoteReply) {
+	// 失败的也要传回 channel ，提供 retry 的契机
+	ok := rf.peers[to].Call("Raft.RequestVote", args, reply)
+	wrappedReply := WrappedRequestVoteReply{ok, to, *args, *reply}
+	replyChannel <- wrappedReply
+}
+
 func (rf *Raft) doElection() {
 	rf.raftState.wLock()
 	rf.raftState.currentTerm += 1
 	rf.raftState.votedFor = rf.me
 	rf.raftState.wUnlock()
 	// TODO: send out request vote rpc
-	// TODO: 在 send 的函数中也用局部变量计数，如果过半则变成 leader ，如果 status/term 改变则停掉那个线程
+	// TODO: 在 send 的函数中也用局部变量计数，如果过半则变成 leader ，如果 state/term 改变则停掉那个线程
 	// 函数大概长这样：go send go send go send, ch recv, if ok, ++, 看看是不是变成 leader，if !ok, retry
 	var electionMaxTime int
 	electionMaxTime = 15 + rand.Intn(15)
