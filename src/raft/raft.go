@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"fmt"
 	"log"
+
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -65,7 +67,9 @@ type Raft struct {
 	// state a Raft server must maintain.
 	raftState *RaftState
 
-	// TODO: some log flags with wrapped log func
+	// some log flags with wrapped log func
+	electionDebug       bool
+	logReplicationDebug bool
 }
 
 // return currentTerm and whether this server
@@ -76,6 +80,39 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 	return term, isleader
+}
+
+func (rf *Raft) logWithRaftStatus(format string, vars ...interface{}) {
+	var stateString string
+	state := rf.raftState.state
+	switch state {
+	case candidateState:
+		stateString = "candidate"
+		break
+	case leaderState:
+		stateString = "leader"
+		break
+	case followerState:
+		stateString = "follower"
+		break
+	default:
+		log.Fatal("undefined raft state.")
+		break
+	}
+	rightHalf := fmt.Sprintf(format, vars...)
+	log.Printf("server %d %s in term %d votedFor %d | %s", rf.me, stateString, rf.raftState.currentTerm, rightHalf)
+}
+
+func (rf *Raft) electionLog(format string, vars ...interface{}) {
+	if rf.electionDebug {
+		rf.logWithRaftStatus(format, vars...)
+	}
+}
+
+func (rf *Raft) logReplicationLog(format string, vars ...interface{}) {
+	if rf.logReplicationDebug {
+		rf.logWithRaftStatus(format, vars...)
+	}
 }
 
 //
