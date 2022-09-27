@@ -54,6 +54,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntry struct {
+	term    int
+	command interface{}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -68,6 +73,8 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	raftState *RaftState
+
+	log []LogEntry
 
 	// some log flags with wrapped log func
 	electionDebug       bool
@@ -224,6 +231,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.raftState.wUnlock()
 }
 
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+	Entries  []LogEntry
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+// AppendEntries RPC handler
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+}
+
 //
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -318,8 +340,81 @@ func (rf *Raft) killed() bool {
 // 以 10 ms 为一个循环单位，循环单位太短可能会因为代码运行时间而影响实际时间
 const loopTimeUnit = 10
 
-func (rf *Raft) leaderMain() {
+type WrappedAppendEntriesReply struct {
+	ok    bool
+	from  int
+	args  AppendEntriesArgs
+	reply AppendEntriesReply
+}
 
+// 一些考虑：
+// 因为 heartbeat 一直在发，如果每个都有 fail 而不结束（比如有一个 peer 挂了），
+// 线程会堆积过多，导致不必要的内存占用
+// 遂考虑心跳包失败不重发，只有增加日志重发
+// 但是心跳的 reply 处理还是要做的，问题是怎么退出？答：计数，全都返回了或失败了就退出
+// 这里的问题就是，如果上一条日志还没有 commit ，下一条命令就发过来了，raft 应该怎么做？
+
+func (rf *Raft) sendHeartbeatToAll() {
+	rf.raftState.rLock()
+	thisTerm := rf.raftState.currentTerm
+	rf.raftState.rUnlock()
+	replyChannel := make(chan WrappedAppendEntriesReply, 10)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.raftState.rLock()
+		args := AppendEntriesArgs{rf.raftState.currentTerm, rf.me, nil}
+		rf.raftState.rUnlock()
+		var reply AppendEntriesReply
+		go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
+	}
+	// process reply
+	replyCount := 0
+	for {
+		rf.raftState.rLock()
+		if rf.raftState.currentTerm > thisTerm || rf.raftState.state != leaderState {
+			rf.raftState.rUnlock()
+			break
+		}
+		if replyCount == len(rf.peers)-1 {
+			break
+		}
+		rf.raftState.rUnlock()
+		reply := <-replyChannel
+		replyCount += 1
+		if reply.ok {
+			rf.electionLog("get heartbeat reply from server %d\n", reply.from)
+			rf.raftState.wLock()
+			if reply.reply.Term > rf.raftState.currentTerm {
+				rf.raftState.currentTerm = reply.reply.Term
+				rf.raftState.state = followerState
+			}
+			rf.raftState.wUnlock()
+		}
+	}
+}
+
+func (rf *Raft) sendAppendEntriesWithChannelReply(to int, args *AppendEntriesArgs, reply *AppendEntriesReply, replyChannel chan WrappedAppendEntriesReply) {
+	// 失败的也要传回 channel ，提供 retry 的契机
+	ok := rf.peers[to].Call("Raft.AppendEntries", args, reply)
+	wrappedReply := WrappedAppendEntriesReply{ok, to, *args, *reply}
+	replyChannel <- wrappedReply
+}
+
+func (rf *Raft) leaderMain() {
+	// 每 40 ms 发送一轮 heartbeat
+	for {
+		// send heartbeat to all servers
+		go rf.sendHeartbeatToAll()
+
+		time.Sleep(time.Millisecond * time.Duration(loopTimeUnit*4))
+
+		// check if state changed by reply
+		if rf.raftState.currentTerm != leaderState {
+			break
+		}
+	}
 }
 
 // warpped reply for check and retry
@@ -392,9 +487,8 @@ func (rf *Raft) doElection() {
 	rf.raftState.currentTerm += 1
 	rf.raftState.votedFor = rf.me
 	rf.raftState.wUnlock()
-	// TODO: send out request vote rpc
-	// TODO: 在 send 的函数中也用局部变量计数，如果过半则变成 leader ，如果 state/term 改变则停掉那个线程
-	// 函数大概长这样：go send go send go send, ch recv, if ok, ++, 看看是不是变成 leader，if !ok, retry
+	// send out request vote rpc
+	go rf.sendRequestVoteToAll()
 	var electionMaxTime int
 	electionMaxTime = 15 + rand.Intn(15)
 	for i := 0; i < electionMaxTime; i++ {
