@@ -20,6 +20,8 @@ package raft
 import (
 	"fmt"
 	"log"
+	"math/rand"
+	"time"
 
 	//	"bytes"
 	"sync"
@@ -277,14 +279,61 @@ func (rf *Raft) killed() bool {
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
+// func (rf *Raft) ticker() {
+// 	for rf.killed() == false {
 
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
+// 		// Your code here to check if a leader election should
+// 		// be started and to randomize sleeping time using
+// 		// time.Sleep().
 
+// 	}
+// }
+
+// 以 10 ms 为一个循环单位，循环单位太短可能会因为代码运行时间而影响实际时间
+const loopTimeUnit = 10
+
+func (rf *Raft) leaderMain() {
+
+}
+
+func (rf *Raft) doElection() {
+	rf.raftState.wLock()
+	rf.raftState.currentTerm += 1
+	rf.raftState.votedFor = rf.me
+	rf.raftState.wUnlock()
+	// TODO: send out request vote rpc
+	// TODO: 在 send 的函数中也用局部变量计数，如果过半则变成 leader ，如果 status/term 改变则停掉那个线程
+	// 函数大概长这样：go send go send go send, ch recv, if ok, ++, 看看是不是变成 leader，if !ok, retry
+	var electionMaxTime int
+	electionMaxTime = 15 + rand.Intn(15)
+	for i := 0; i < electionMaxTime; i++ {
+		time.Sleep(time.Duration(loopTimeUnit) * time.Millisecond)
+		rf.raftState.rLock()
+		// 如果发现已经不是 candidate，则 break
+		if rf.raftState.state != candidateState {
+			rf.raftState.rUnlock()
+			break
+		}
+		rf.raftState.rUnlock()
 	}
+	// next election time out or change to other state
+}
+
+func (rf *Raft) followerMain() {
+	var electionMaxTime int
+	electionMaxTime = 15 + rand.Intn(15)
+	for i := 0; i < electionMaxTime; i++ {
+		time.Sleep(time.Duration(loopTimeUnit) * time.Millisecond)
+		rf.raftState.rLock()
+		if rf.raftState.resetElectionTimer {
+			i = 0
+		}
+		rf.raftState.rUnlock()
+	}
+	rf.raftState.wLock()
+	rf.raftState.state = candidateState
+	rf.electionLog("election time out,  become candidate\n")
+	rf.raftState.wUnlock()
 }
 
 func (rf *Raft) mainLoop() {

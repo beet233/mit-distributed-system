@@ -13,6 +13,8 @@ type RaftState struct {
 	currentTerm int
 	votedFor    int
 
+	resetElectionTimer bool
+
 	rf *Raft
 
 	//rwmutex sync.RWMutex
