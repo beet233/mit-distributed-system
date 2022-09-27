@@ -55,8 +55,8 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	term    int
-	command interface{}
+	Term    int
+	Command interface{}
 }
 
 //
@@ -113,7 +113,7 @@ func (rf *Raft) logWithRaftStatus(format string, vars ...interface{}) {
 		break
 	}
 	rightHalf := fmt.Sprintf(format, vars...)
-	log.Printf("server %d %s in term %d votedFor %d | %s", rf.me, stateString, rf.raftState.currentTerm, rightHalf)
+	log.Printf("server %d %s in term %d votedFor %d | %s", rf.me, stateString, rf.raftState.currentTerm, rf.raftState.votedFor, rightHalf)
 }
 
 func (rf *Raft) electionLog(format string, vars ...interface{}) {
@@ -244,6 +244,19 @@ type AppendEntriesReply struct {
 
 // AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.electionLog("recv heartbeat from %d\n", args.LeaderId)
+	rf.raftState.wLock()
+	if args.Term > rf.raftState.currentTerm {
+		rf.raftState.currentTerm = args.Term
+		rf.raftState.state = followerState
+		rf.raftState.votedFor = -1
+	}
+	if rf.raftState.state == candidateState {
+		rf.electionLog("turn into follower from candidate\n")
+		rf.raftState.state = followerState
+	}
+	rf.raftState.resetElectionTimer = true
+	rf.raftState.wUnlock()
 }
 
 //
@@ -378,6 +391,7 @@ func (rf *Raft) sendHeartbeatToAll() {
 			break
 		}
 		if replyCount == len(rf.peers)-1 {
+			rf.raftState.rUnlock()
 			break
 		}
 		rf.raftState.rUnlock()
@@ -387,6 +401,7 @@ func (rf *Raft) sendHeartbeatToAll() {
 			rf.electionLog("get heartbeat reply from server %d\n", reply.from)
 			rf.raftState.wLock()
 			if reply.reply.Term > rf.raftState.currentTerm {
+				rf.electionLog("turn into follower for term update\n")
 				rf.raftState.currentTerm = reply.reply.Term
 				rf.raftState.state = followerState
 			}
@@ -406,6 +421,7 @@ func (rf *Raft) leaderMain() {
 	// 每 40 ms 发送一轮 heartbeat
 	for {
 		// send heartbeat to all servers
+		rf.electionLog("send out heartbeats\n")
 		go rf.sendHeartbeatToAll()
 
 		time.Sleep(time.Millisecond * time.Duration(loopTimeUnit*4))
@@ -454,19 +470,18 @@ func (rf *Raft) sendRequestVoteToAll() {
 			rf.electionLog("get reply from server %d\n", reply.from)
 			rf.raftState.wLock()
 			if reply.reply.Term > rf.raftState.currentTerm {
+				rf.electionLog("turn into follower for term update\n")
 				rf.raftState.currentTerm = reply.reply.Term
 				rf.raftState.state = followerState
 			}
-			rf.raftState.wUnlock()
 			if reply.reply.VoteGranted {
 				grantedVoteSum += 1
-				if grantedVoteSum > len(rf.peers)/2 {
+				if grantedVoteSum > len(rf.peers)/2 && rf.raftState.isState(candidateState) {
 					rf.electionLog("become leader\n")
-					rf.raftState.wLock()
 					rf.raftState.state = leaderState
-					rf.raftState.wUnlock()
 				}
 			}
+			rf.raftState.wUnlock()
 		} else {
 			// retry
 			var retryReply RequestVoteReply
@@ -512,6 +527,7 @@ func (rf *Raft) followerMain() {
 		rf.raftState.rLock()
 		if rf.raftState.resetElectionTimer {
 			i = 0
+			rf.raftState.resetElectionTimer = false
 		}
 		rf.raftState.rUnlock()
 	}
@@ -563,7 +579,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	// TODO: init all status to follower
+	rf.electionDebug = true
+	rf.logReplicationDebug = true
+	rf.raftState = MakeRaftState(rf)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

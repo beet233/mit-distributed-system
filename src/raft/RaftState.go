@@ -44,3 +44,15 @@ func (rs *RaftState) wLock() {
 func (rs *RaftState) wUnlock() {
 	rs.rwmutex.Unlock()
 }
+
+// init
+func MakeRaftState(raft *Raft) *RaftState {
+	rs := &RaftState{
+		currentTerm:        0,
+		votedFor:           -1,
+		state:              followerState,
+		rf:                 raft,
+		resetElectionTimer: false,
+	}
+	return rs
+}
