@@ -270,7 +270,11 @@ type AppendEntriesReply struct {
 
 // AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.electionLog("recv AppendEntries from %d\n", args.LeaderId)
+	if args.Entries == nil {
+		rf.electionLog("recv heartbeat from %d\n", args.LeaderId)
+	} else {
+		rf.logReplicationLog("recv AppendEntries from %d\n", args.LeaderId)
+	}
 	rf.raftState.wLock()
 	if args.Term > rf.raftState.currentTerm {
 		rf.raftState.currentTerm = args.Term

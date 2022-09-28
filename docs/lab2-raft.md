@@ -227,6 +227,8 @@ Raft 采用投票的方式来保证一个 candidate 只有拥有之前所有任�
 
 leader 收到 client 的 command 后返回的全过程：
 
+TODO：这个框里的日志相关都还没实现
+
 ![image-20220924201353097](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/image-20220924201353097.png)
 
 只要其他 follower 收到了（AppendEntries 的 reply 的 success 不为 false），后面就等它们自动 apply 就行，leader 这边就已经认为它们成功了，更新 nextIndex 和 matchIndex。如果超过半数的 server 都成功了，leader 更新 commitIndex，然后会因此触发 apply 到状态机，然后返回给 client 成功。
