@@ -29,6 +29,7 @@ import (
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
+	"github.com/sasha-s/go-deadlock"
 )
 
 //
@@ -74,7 +75,12 @@ type Raft struct {
 	// state a Raft server must maintain.
 	raftState *RaftState
 
-	log []LogEntry
+	log         []LogEntry
+	logMutex    deadlock.RWMutex
+	commitIndex int
+	lastApplied int
+	nextIndex   []int
+	matchIndex  []int
 
 	// some log flags with wrapped log func
 	electionDebug       bool
@@ -192,8 +198,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int
-	CandidateId int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -221,10 +229,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.raftState.state = followerState
 		}
 		if rf.raftState.votedFor == -1 || rf.raftState.votedFor == args.CandidateId {
-			// TODO: if candidate's log is at least as up-to-date as mine, then grant vote
-			rf.electionLog("vote for %d\n", args.CandidateId)
-			reply.VoteGranted = true
-			rf.raftState.votedFor = args.CandidateId
+			// if candidate's log is at least as up-to-date as mine, then grant vote
+			// 怎么判断 candidate 是不是至少比 “我” 新？我有可能比它的 Log 少，而且我可能以前当过失败的 leader ，有着它没有的 Log，这个还挺有意思，可以在文档补充
+			isNewerThanMe := false
+			rf.logMutex.RLock()
+			if args.LastLogTerm > rf.log[len(rf.log)-1].Term {
+				isNewerThanMe = true
+			} else if args.LastLogTerm == rf.log[len(rf.log)-1].Term {
+				if args.LastLogIndex >= len(rf.log)-1 {
+					isNewerThanMe = true
+				}
+			}
+			rf.logMutex.RUnlock()
+			if isNewerThanMe {
+				rf.electionLog("vote for %d\n", args.CandidateId)
+				reply.VoteGranted = true
+				rf.raftState.votedFor = args.CandidateId
+			} else {
+				rf.electionLog("refuse to vote for %d\n", args.CandidateId)
+			}
 		}
 	}
 	reply.Term = rf.raftState.currentTerm
@@ -232,9 +255,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
-	Entries  []LogEntry
+	Term         int
+	LeaderId     int
+	Entries      []LogEntry
+	PrevLogIndex int
+	PrevLogTerm  int
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -244,7 +270,7 @@ type AppendEntriesReply struct {
 
 // AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.electionLog("recv heartbeat from %d\n", args.LeaderId)
+	rf.electionLog("recv AppendEntries from %d\n", args.LeaderId)
 	rf.raftState.wLock()
 	if args.Term > rf.raftState.currentTerm {
 		rf.raftState.currentTerm = args.Term
@@ -256,6 +282,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.raftState.state = followerState
 	}
 	rf.raftState.resetElectionTimer = true
+
+	reply.Term = rf.raftState.currentTerm
+	reply.Success = true
+	if args.Term < rf.raftState.currentTerm {
+		reply.Success = false
+	} else {
+		if args.PrevLogIndex > len(rf.log)-1 || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			reply.Success = false
+		} else {
+			// 直接把新的都 append 进去
+			rf.log = rf.log[0 : args.PrevLogIndex+1]
+			for i := 0; i < len(args.Entries); i++ {
+				rf.log = append(rf.log, args.Entries[i])
+			}
+			if args.LeaderCommit > rf.commitIndex {
+				if args.LeaderCommit < len(rf.log)-1 {
+					rf.commitIndex = args.LeaderCommit
+				} else {
+					rf.commitIndex = len(rf.log) - 1
+				}
+			}
+		}
+	}
 	rf.raftState.wUnlock()
 }
 
