@@ -75,8 +75,9 @@ type Raft struct {
 	// state a Raft server must maintain.
 	raftState *RaftState
 
-	log         []LogEntry
-	logMutex    deadlock.RWMutex
+	log      []LogEntry
+	logMutex deadlock.RWMutex
+	// TODO: 这里需不需要锁呢？
 	commitIndex int
 	lastApplied int
 	nextIndex   []int
@@ -289,22 +290,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.raftState.currentTerm
 	reply.Success = true
-	if args.Term < rf.raftState.currentTerm {
-		reply.Success = false
-	} else {
-		if args.PrevLogIndex > len(rf.log)-1 || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.Entries != nil {
+		if args.Term < rf.raftState.currentTerm {
 			reply.Success = false
 		} else {
-			// 直接把新的都 append 进去
-			rf.log = rf.log[0 : args.PrevLogIndex+1]
-			for i := 0; i < len(args.Entries); i++ {
-				rf.log = append(rf.log, args.Entries[i])
-			}
-			if args.LeaderCommit > rf.commitIndex {
-				if args.LeaderCommit < len(rf.log)-1 {
-					rf.commitIndex = args.LeaderCommit
-				} else {
-					rf.commitIndex = len(rf.log) - 1
+			if args.PrevLogIndex > len(rf.log)-1 || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+				reply.Success = false
+			} else {
+				// 直接把新的都 append 进去
+				rf.log = rf.log[0 : args.PrevLogIndex+1]
+				for i := 0; i < len(args.Entries); i++ {
+					rf.log = append(rf.log, args.Entries[i])
+				}
+				if args.LeaderCommit > rf.commitIndex {
+					if args.LeaderCommit < len(rf.log)-1 {
+						rf.commitIndex = args.LeaderCommit
+					} else {
+						rf.commitIndex = len(rf.log) - 1
+					}
 				}
 			}
 		}
@@ -366,7 +369,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
+	rf.raftState.rLock()
+	rf.logMutex.Lock()
+	rf.log = append(rf.log, LogEntry{rf.raftState.currentTerm, command})
+	// broadcast this log
+	// 这里直接 go 出去，这个 Start 需要 immediately return. (毕竟 rs 还锁着，请求的 reply 也可能改变 rs)
+	go rf.sendAppendEntriesToAll()
+	index = len(rf.log) - 1
+	term = rf.raftState.currentTerm
+	isLeader = rf.raftState.isState(leaderState)
+	rf.logMutex.Unlock()
+	rf.raftState.rUnlock()
 	return index, term, isLeader
 }
 
@@ -430,7 +443,10 @@ func (rf *Raft) sendHeartbeatToAll() {
 			continue
 		}
 		rf.raftState.rLock()
-		args := AppendEntriesArgs{rf.raftState.currentTerm, rf.me, nil}
+		rf.logMutex.RLock()
+		// heartbeat 的后三个参数不会被考虑，不牵扯到 log replication
+		args := AppendEntriesArgs{rf.raftState.currentTerm, rf.me, nil, -1, -1, -1}
+		rf.logMutex.RUnlock()
 		rf.raftState.rUnlock()
 		var reply AppendEntriesReply
 		go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
@@ -463,6 +479,10 @@ func (rf *Raft) sendHeartbeatToAll() {
 	}
 }
 
+func (rf *Raft) sendAppendEntriesToAll() {
+
+}
+
 func (rf *Raft) sendAppendEntriesWithChannelReply(to int, args *AppendEntriesArgs, reply *AppendEntriesReply, replyChannel chan WrappedAppendEntriesReply) {
 	// 失败的也要传回 channel ，提供 retry 的契机
 	ok := rf.peers[to].Call("Raft.AppendEntries", args, reply)
@@ -471,6 +491,18 @@ func (rf *Raft) sendAppendEntriesWithChannelReply(to int, args *AppendEntriesArg
 }
 
 func (rf *Raft) leaderMain() {
+	// reinitialize nextIndex and matchIndex
+	// TODO: 是否需要对这几个状态加锁？
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.logMutex.RLock()
+	for i, _ := range rf.nextIndex {
+		rf.nextIndex[i] = len(rf.log) - 1
+	}
+	for i, _ := range rf.matchIndex {
+		rf.matchIndex[i] = 0
+	}
+	rf.logMutex.RUnlock()
 	// 每 40 ms 发送一轮 heartbeat
 	for {
 		// send heartbeat to all servers
@@ -505,7 +537,9 @@ func (rf *Raft) sendRequestVoteToAll() {
 			continue
 		}
 		rf.raftState.rLock()
-		args := RequestVoteArgs{rf.raftState.currentTerm, rf.me}
+		rf.logMutex.RLock()
+		args := RequestVoteArgs{rf.raftState.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-1].Term}
+		rf.logMutex.RUnlock()
 		rf.raftState.rUnlock()
 		var reply RequestVoteReply
 		go rf.sendRequestVoteWithChannelReply(i, &args, &reply, replyChannel)
@@ -635,6 +669,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionDebug = true
 	rf.logReplicationDebug = true
 	rf.raftState = MakeRaftState(rf)
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -642,6 +678,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	// go rf.ticker()
 	go rf.mainLoop()
+	// TODO: maybe we need a apply loop like I starred in edge
 
 	return rf
 }

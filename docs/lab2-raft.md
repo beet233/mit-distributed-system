@@ -221,6 +221,8 @@ Raft 采用投票的方式来保证一个 candidate 只有拥有之前所有任�
 
 这里判断的时候我们可以回顾之前的日志匹配特性（Log Matching Property），在本文上面不远处。
 
+[Raft算法 - 知乎 (zhihu.com)](https://zhuanlan.zhihu.com/p/50912173)
+
 
 
 
