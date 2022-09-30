@@ -83,6 +83,12 @@ type Raft struct {
 	nextIndex   []int
 	matchIndex  []int
 
+	// apply notify channel
+	applyNotifyCh chan int
+
+	// apply channel
+	applyCh chan ApplyMsg
+
 	// some log flags with wrapped log func
 	electionDebug       bool
 	logReplicationDebug bool
@@ -234,7 +240,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			// 怎么判断 candidate 是不是至少比 “我” 新？我有可能比它的 Log 少，而且我可能以前当过失败的 leader ，有着它没有的 Log，这个还挺有意思，可以在文档补充
 			isNewerThanMe := false
 			rf.logMutex.RLock()
-			if args.LastLogTerm > rf.log[len(rf.log)-1].Term {
+			if len(rf.log) == 0 || args.LastLogTerm > rf.log[len(rf.log)-1].Term {
 				isNewerThanMe = true
 			} else if args.LastLogTerm == rf.log[len(rf.log)-1].Term {
 				if args.LastLogIndex >= len(rf.log)-1 {
@@ -294,7 +300,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.Term < rf.raftState.currentTerm {
 			reply.Success = false
 		} else {
-			if args.PrevLogIndex > len(rf.log)-1 || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			if args.PrevLogIndex > len(rf.log)-1 || (args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
 				reply.Success = false
 			} else {
 				// 直接把新的都 append 进去
@@ -308,6 +314,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					} else {
 						rf.commitIndex = len(rf.log) - 1
 					}
+					rf.applyNotifyCh <- 0
 				}
 			}
 		}
@@ -371,14 +378,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.raftState.rLock()
 	rf.logMutex.Lock()
-	rf.log = append(rf.log, LogEntry{rf.raftState.currentTerm, command})
-	// broadcast this log
-	// 这里直接 go 出去，这个 Start 需要 immediately return. (毕竟 rs 还锁着，请求的 reply 也可能改变 rs)
-	// 这样有可能发生这样的情况：上一个 Start 加入了 log，还没 send 出去，新的 log 又加入了，然鹅仔细一看，这好像并不会引发错误
-	go rf.sendAppendEntriesToAll()
+	isLeader = rf.raftState.isState(leaderState)
+	if isLeader {
+		rf.log = append(rf.log, LogEntry{rf.raftState.currentTerm, command})
+		// broadcast this log
+		// 这里直接 go 出去，这个 Start 需要 immediately return. (毕竟 rs 还锁着，请求的 reply 也可能改变 rs)
+		// 这样有可能发生这样的情况：上一个 Start 加入了 log，还没 send 出去，新的 log 又加入了，然鹅仔细一看，这好像并不会引发错误
+		go rf.sendAppendEntriesToAll()
+	}
 	index = len(rf.log) - 1
 	term = rf.raftState.currentTerm
-	isLeader = rf.raftState.isState(leaderState)
 	rf.logMutex.Unlock()
 	rf.raftState.rUnlock()
 	return index, term, isLeader
@@ -480,6 +489,29 @@ func (rf *Raft) sendHeartbeatToAll() {
 	}
 }
 
+func (rf *Raft) tryIncrementCommitIndex() {
+	for i := rf.commitIndex + 1; ; i++ {
+		rf.logMutex.RLock()
+		if i > len(rf.log)-1 {
+			rf.logMutex.RUnlock()
+			break
+		}
+		rf.logMutex.RUnlock()
+		if rf.log[i].Term == rf.raftState.currentTerm {
+			count := 0
+			for j := 0; j < len(rf.peers); j++ {
+				if rf.matchIndex[j] >= i {
+					count += 1
+				}
+			}
+			if count > len(rf.peers)/2 {
+				rf.commitIndex = i
+				rf.applyNotifyCh <- 0
+			}
+		}
+	}
+}
+
 func (rf *Raft) sendAppendEntriesToAll() {
 	rf.raftState.rLock()
 	thisTerm := rf.raftState.currentTerm
@@ -493,7 +525,12 @@ func (rf *Raft) sendAppendEntriesToAll() {
 		rf.logMutex.RLock()
 		if len(rf.log)-1 >= rf.nextIndex[i] {
 			prevLogIndex := len(rf.log) - 2
-			prevLogTerm := rf.log[prevLogIndex].Term
+			var prevLogTerm int
+			if prevLogIndex < 0 {
+				prevLogTerm = -1
+			} else {
+				prevLogTerm = rf.log[prevLogIndex].Term
+			}
 			args := AppendEntriesArgs{rf.raftState.currentTerm, rf.me, rf.log[rf.nextIndex[i]:], prevLogIndex, prevLogTerm, rf.commitIndex}
 			var reply AppendEntriesReply
 			go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
@@ -524,6 +561,7 @@ func (rf *Raft) sendAppendEntriesToAll() {
 				// update nextIndex and matchIndex
 				rf.matchIndex[reply.from] = reply.args.PrevLogIndex + len(reply.args.Entries)
 				rf.nextIndex[reply.from] = rf.matchIndex[reply.from] + 1
+				go rf.tryIncrementCommitIndex()
 			} else {
 				// decrement nextIndex and retry
 				// 根据我自己的逻辑判断，prevLog 也是要 -- 的
@@ -562,7 +600,7 @@ func (rf *Raft) leaderMain() {
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.logMutex.RLock()
 	for i, _ := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.log) - 1
+		rf.nextIndex[i] = len(rf.log)
 	}
 	for i, _ := range rf.matchIndex {
 		rf.matchIndex[i] = 0
@@ -603,7 +641,12 @@ func (rf *Raft) sendRequestVoteToAll() {
 		}
 		rf.raftState.rLock()
 		rf.logMutex.RLock()
-		args := RequestVoteArgs{rf.raftState.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-1].Term}
+		var args RequestVoteArgs
+		if len(rf.log) > 0 {
+			args = RequestVoteArgs{rf.raftState.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-1].Term}
+		} else {
+			args = RequestVoteArgs{rf.raftState.currentTerm, rf.me, -1, -1}
+		}
 		rf.logMutex.RUnlock()
 		rf.raftState.rUnlock()
 		var reply RequestVoteReply
@@ -712,6 +755,29 @@ func (rf *Raft) mainLoop() {
 	}
 }
 
+func (rf *Raft) applyLoop() {
+	for {
+		// waiting for notify
+		<-rf.applyNotifyCh
+		if rf.commitIndex > rf.lastApplied {
+			nextApplied := rf.lastApplied + 1
+			toBeApplied := rf.log[nextApplied : rf.commitIndex+1]
+			// send to channel
+			go func(nextApplied int, toBeApplied *[]LogEntry) {
+				for i, entry := range *toBeApplied {
+					rf.applyCh <- ApplyMsg{
+						Command:      entry.Command,
+						CommandValid: true,
+						CommandIndex: i + nextApplied,
+					}
+				}
+			}(nextApplied, &toBeApplied)
+			rf.logReplicationLog("apply %d entries to state machine\n", len(toBeApplied))
+			rf.lastApplied += len(toBeApplied)
+		}
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -736,6 +802,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.raftState = MakeRaftState(rf)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -743,7 +810,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	// go rf.ticker()
 	go rf.mainLoop()
-	// TODO: maybe we need a apply loop like I starred in edge
-
+	go rf.applyLoop()
 	return rf
 }
