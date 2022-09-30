@@ -374,6 +374,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, LogEntry{rf.raftState.currentTerm, command})
 	// broadcast this log
 	// 这里直接 go 出去，这个 Start 需要 immediately return. (毕竟 rs 还锁着，请求的 reply 也可能改变 rs)
+	// 这样有可能发生这样的情况：上一个 Start 加入了 log，还没 send 出去，新的 log 又加入了，然鹅仔细一看，这好像并不会引发错误
 	go rf.sendAppendEntriesToAll()
 	index = len(rf.log) - 1
 	term = rf.raftState.currentTerm
@@ -480,7 +481,71 @@ func (rf *Raft) sendHeartbeatToAll() {
 }
 
 func (rf *Raft) sendAppendEntriesToAll() {
-
+	rf.raftState.rLock()
+	thisTerm := rf.raftState.currentTerm
+	rf.raftState.rUnlock()
+	replyChannel := make(chan WrappedAppendEntriesReply, 10)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.raftState.rLock()
+		rf.logMutex.RLock()
+		if len(rf.log)-1 >= rf.nextIndex[i] {
+			prevLogIndex := len(rf.log) - 2
+			prevLogTerm := rf.log[prevLogIndex].Term
+			args := AppendEntriesArgs{rf.raftState.currentTerm, rf.me, rf.log[rf.nextIndex[i]:], prevLogIndex, prevLogTerm, rf.commitIndex}
+			var reply AppendEntriesReply
+			go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
+		}
+		rf.logMutex.RUnlock()
+		rf.raftState.rUnlock()
+	}
+	// process reply
+	for {
+		rf.raftState.rLock()
+		if rf.raftState.currentTerm > thisTerm || rf.raftState.state != leaderState {
+			rf.raftState.rUnlock()
+			break
+		}
+		rf.raftState.rUnlock()
+		reply := <-replyChannel
+		if reply.ok {
+			rf.electionLog("get AppendEntries reply from server %d\n", reply.from)
+			rf.raftState.wLock()
+			if reply.reply.Term > rf.raftState.currentTerm {
+				rf.electionLog("turn into follower for term update\n")
+				rf.raftState.currentTerm = reply.reply.Term
+				rf.raftState.state = followerState
+			}
+			rf.raftState.wUnlock()
+			// TODO: check this part
+			if reply.reply.Success {
+				// update nextIndex and matchIndex
+				rf.matchIndex[reply.from] = reply.args.PrevLogIndex + len(reply.args.Entries)
+				rf.nextIndex[reply.from] = rf.matchIndex[reply.from] + 1
+			} else {
+				// decrement nextIndex and retry
+				// 根据我自己的逻辑判断，prevLog 也是要 -- 的
+				if rf.nextIndex[reply.from] > 0 {
+					rf.nextIndex[reply.from] -= 1
+				}
+				newArgs := reply.args
+				newArgs.PrevLogIndex -= 1
+				rf.logMutex.RLock()
+				if newArgs.PrevLogIndex >= 0 {
+					newArgs.PrevLogTerm = rf.log[newArgs.PrevLogIndex].Term
+				}
+				rf.logMutex.RUnlock()
+				var newReply AppendEntriesReply
+				go rf.sendAppendEntriesWithChannelReply(reply.from, &newArgs, &newReply, replyChannel)
+			}
+		} else {
+			// resend same failed msg for network error
+			var newReply AppendEntriesReply
+			go rf.sendAppendEntriesWithChannelReply(reply.from, &reply.args, &newReply, replyChannel)
+		}
+	}
 }
 
 func (rf *Raft) sendAppendEntriesWithChannelReply(to int, args *AppendEntriesArgs, reply *AppendEntriesReply, replyChannel chan WrappedAppendEntriesReply) {
