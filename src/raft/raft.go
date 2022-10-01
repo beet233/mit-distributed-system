@@ -83,6 +83,8 @@ type Raft struct {
 	nextIndex   []int
 	matchIndex  []int
 
+	leaderInitDone bool
+
 	// apply notify channel
 	applyNotifyCh chan int
 
@@ -380,6 +382,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.logMutex.Lock()
 	isLeader = rf.raftState.isState(leaderState)
 	if isLeader {
+		for !rf.leaderInitDone {
+			time.Sleep(time.Millisecond)
+		}
 		rf.log = append(rf.log, LogEntry{rf.raftState.currentTerm, command})
 		// broadcast this log
 		// 这里直接 go 出去，这个 Start 需要 immediately return. (毕竟 rs 还锁着，请求的 reply 也可能改变 rs)
@@ -594,6 +599,8 @@ func (rf *Raft) sendAppendEntriesWithChannelReply(to int, args *AppendEntriesArg
 }
 
 func (rf *Raft) leaderMain() {
+	// 发现有这里还没 init 完，已经有请求 Start 进了这个 leader ，导致 nextIndex 等 state 错误
+	// 添加 leaderInitDone 在 RaftState 中
 	// reinitialize nextIndex and matchIndex
 	// TODO: 是否需要对这几个状态加锁？
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -606,6 +613,7 @@ func (rf *Raft) leaderMain() {
 		rf.matchIndex[i] = 0
 	}
 	rf.logMutex.RUnlock()
+	rf.leaderInitDone = true
 	// 每 40 ms 发送一轮 heartbeat
 	for {
 		// send heartbeat to all servers
@@ -674,6 +682,7 @@ func (rf *Raft) sendRequestVoteToAll() {
 				if grantedVoteSum > len(rf.peers)/2 && rf.raftState.isState(candidateState) {
 					rf.electionLog("become leader\n")
 					rf.raftState.state = leaderState
+					rf.leaderInitDone = false
 				}
 			}
 			rf.raftState.wUnlock()
@@ -803,6 +812,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
+	rf.leaderInitDone = false
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
