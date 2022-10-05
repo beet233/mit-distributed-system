@@ -128,7 +128,7 @@ func (rf *Raft) logWithRaftStatus(format string, vars ...interface{}) {
 		break
 	}
 	rightHalf := fmt.Sprintf(format, vars...)
-	log.Printf("server %d %s in term %d votedFor %d | %s", rf.me, stateString, rf.raftState.currentTerm, rf.raftState.votedFor, rightHalf)
+	log.Printf("server %d %s in term %d votedFor %d commitIndex %d | %s", rf.me, stateString, rf.raftState.currentTerm, rf.raftState.votedFor, rf.commitIndex, rightHalf)
 }
 
 func (rf *Raft) electionLog(format string, vars ...interface{}) {
@@ -298,28 +298,34 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.raftState.currentTerm
 	reply.Success = true
+	if args.Term < rf.raftState.currentTerm {
+		reply.Success = false
+		rf.raftState.wUnlock()
+		return
+	}
+	if args.PrevLogIndex > len(rf.log)-1 || (args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+		reply.Success = false
+		rf.raftState.wUnlock()
+		return
+	}
 	if args.Entries != nil {
-		if args.Term < rf.raftState.currentTerm {
-			reply.Success = false
-		} else {
-			if args.PrevLogIndex > len(rf.log)-1 || (args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
-				reply.Success = false
-			} else {
-				// 直接把新的都 append 进去
-				rf.log = rf.log[0 : args.PrevLogIndex+1]
-				for i := 0; i < len(args.Entries); i++ {
-					rf.log = append(rf.log, args.Entries[i])
-				}
-				if args.LeaderCommit > rf.commitIndex {
-					if args.LeaderCommit < len(rf.log)-1 {
-						rf.commitIndex = args.LeaderCommit
-					} else {
-						rf.commitIndex = len(rf.log) - 1
-					}
-					rf.applyNotifyCh <- 0
-				}
-			}
+		// 直接把新的都 append 进去
+		rf.logReplicationLog("log copying...\n")
+		rf.logReplicationLog("original log: %v\n", rf.log)
+		rf.log = rf.log[0 : args.PrevLogIndex+1]
+		for i := 0; i < len(args.Entries); i++ {
+			rf.log = append(rf.log, args.Entries[i])
 		}
+		rf.logReplicationLog("appended log: %v\n", rf.log)
+	}
+	if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit < len(rf.log)-1 {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = len(rf.log) - 1
+		}
+		rf.logReplicationLog("input 0 into applyNotifyCh\n")
+		rf.applyNotifyCh <- 0
 	}
 	rf.raftState.wUnlock()
 }
@@ -373,6 +379,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.logReplicationLog("recv %v\n", command)
 	index := -1
 	term := -1
 	isLeader := true
@@ -382,9 +389,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.logMutex.Lock()
 	isLeader = rf.raftState.isState(leaderState)
 	if isLeader {
+		rf.logReplicationLog("waiting for leader init...\n")
 		for !rf.leaderInitDone {
 			time.Sleep(time.Millisecond)
 		}
+		rf.logReplicationLog("append %v into local\n", command)
 		rf.log = append(rf.log, LogEntry{rf.raftState.currentTerm, command})
 		// broadcast this log
 		// 这里直接 go 出去，这个 Start 需要 immediately return. (毕竟 rs 还锁着，请求的 reply 也可能改变 rs)
@@ -459,8 +468,12 @@ func (rf *Raft) sendHeartbeatToAll() {
 		}
 		rf.raftState.rLock()
 		rf.logMutex.RLock()
-		// heartbeat 的后三个参数不会被考虑，不牵扯到 log replication
-		args := AppendEntriesArgs{rf.raftState.currentTerm, rf.me, nil, -1, -1, -1}
+		prevLogIndex := len(rf.log) - 1
+		prevLogTerm := -1
+		if prevLogIndex >= 0 {
+			prevLogTerm = rf.log[prevLogIndex].Term
+		}
+		args := AppendEntriesArgs{rf.raftState.currentTerm, rf.me, nil, prevLogIndex, prevLogTerm, rf.commitIndex}
 		rf.logMutex.RUnlock()
 		rf.raftState.rUnlock()
 		var reply AppendEntriesReply
@@ -511,6 +524,7 @@ func (rf *Raft) tryIncrementCommitIndex() {
 			}
 			if count > len(rf.peers)/2 {
 				rf.commitIndex = i
+				rf.logReplicationLog("input 0 into applyNotifyCh\n")
 				rf.applyNotifyCh <- 0
 			}
 		}
@@ -563,11 +577,13 @@ func (rf *Raft) sendAppendEntriesToAll() {
 			rf.raftState.wUnlock()
 			// TODO: check this part
 			if reply.reply.Success {
+				rf.logReplicationLog("server %d append success!\n", reply.from)
 				// update nextIndex and matchIndex
 				rf.matchIndex[reply.from] = reply.args.PrevLogIndex + len(reply.args.Entries)
 				rf.nextIndex[reply.from] = rf.matchIndex[reply.from] + 1
 				go rf.tryIncrementCommitIndex()
 			} else {
+				rf.logReplicationLog("server %d append failed and retry!\n", reply.from)
 				// decrement nextIndex and retry
 				// 根据我自己的逻辑判断，prevLog 也是要 -- 的
 				if rf.nextIndex[reply.from] > 0 {
@@ -765,9 +781,10 @@ func (rf *Raft) mainLoop() {
 }
 
 func (rf *Raft) applyLoop() {
-	for {
+	for !rf.killed() {
 		// waiting for notify
-		<-rf.applyNotifyCh
+		_ = <-rf.applyNotifyCh
+		rf.logReplicationLog("applyNotifyCh recv notification\n")
 		if rf.commitIndex > rf.lastApplied {
 			nextApplied := rf.lastApplied + 1
 			toBeApplied := rf.log[nextApplied : rf.commitIndex+1]
@@ -809,10 +826,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionDebug = true
 	rf.logReplicationDebug = true
 	rf.raftState = MakeRaftState(rf)
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	rf.commitIndex = -1
+	rf.lastApplied = -1
 	rf.applyCh = applyCh
 	rf.leaderInitDone = false
+	rf.applyNotifyCh = make(chan int)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

@@ -502,8 +502,11 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 		}
 
 		cfg.mu.Lock()
+		// ??? 这个 logs 里并没有我添加成功的 log ，我有什么办法？？
 		cmd1, ok := cfg.logs[i][index]
 		cfg.mu.Unlock()
+
+		cfg.t.Logf("ok: %v, cmd1: %v", ok, cmd1)
 
 		if ok {
 			if count > 0 && cmd != cmd1 {
@@ -589,6 +592,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				cfg.t.Logf("index: %d, nd: %v, cmd1: %v, cmd: %v", index, nd, cmd1, cmd)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {
@@ -599,14 +603,14 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				time.Sleep(20 * time.Millisecond)
 			}
 			if retry == false {
-				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
+				cfg.t.Fatalf("one(%v) failed to reach agreement at retry", cmd)
 			}
 		} else {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
 	if cfg.checkFinished() == false {
-		cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
+		cfg.t.Fatalf("one(%v) failed to reach agreement at unfinished", cmd)
 	}
 	return -1
 }
