@@ -469,10 +469,7 @@ func (rf *Raft) sendHeartbeatToAll() {
 		rf.raftState.rLock()
 		rf.logMutex.RLock()
 		prevLogIndex := len(rf.log) - 1
-		prevLogTerm := -1
-		if prevLogIndex >= 0 {
-			prevLogTerm = rf.log[prevLogIndex].Term
-		}
+		prevLogTerm := rf.log[prevLogIndex].Term
 		args := AppendEntriesArgs{rf.raftState.currentTerm, rf.me, nil, prevLogIndex, prevLogTerm, rf.commitIndex}
 		rf.logMutex.RUnlock()
 		rf.raftState.rUnlock()
@@ -543,13 +540,8 @@ func (rf *Raft) sendAppendEntriesToAll() {
 		rf.raftState.rLock()
 		rf.logMutex.RLock()
 		if len(rf.log)-1 >= rf.nextIndex[i] {
-			prevLogIndex := len(rf.log) - 2
-			var prevLogTerm int
-			if prevLogIndex < 0 {
-				prevLogTerm = -1
-			} else {
-				prevLogTerm = rf.log[prevLogIndex].Term
-			}
+			prevLogIndex := len(rf.log) - 1
+			prevLogTerm := rf.log[prevLogIndex].Term
 			args := AppendEntriesArgs{rf.raftState.currentTerm, rf.me, rf.log[rf.nextIndex[i]:], prevLogIndex, prevLogTerm, rf.commitIndex}
 			var reply AppendEntriesReply
 			go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
@@ -665,12 +657,7 @@ func (rf *Raft) sendRequestVoteToAll() {
 		}
 		rf.raftState.rLock()
 		rf.logMutex.RLock()
-		var args RequestVoteArgs
-		if len(rf.log) > 0 {
-			args = RequestVoteArgs{rf.raftState.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-1].Term}
-		} else {
-			args = RequestVoteArgs{rf.raftState.currentTerm, rf.me, -1, -1}
-		}
+		args := RequestVoteArgs{rf.raftState.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-1].Term}
 		rf.logMutex.RUnlock()
 		rf.raftState.rUnlock()
 		var reply RequestVoteReply
@@ -826,8 +813,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionDebug = true
 	rf.logReplicationDebug = true
 	rf.raftState = MakeRaftState(rf)
-	rf.commitIndex = -1
-	rf.lastApplied = -1
+	// log[0] is unused, just to start at 1.
+	rf.log = make([]LogEntry, 1)
+	rf.log[0] = LogEntry{
+		Term:    0,
+		Command: nil,
+	}
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rf.applyCh = applyCh
 	rf.leaderInitDone = false
 	rf.applyNotifyCh = make(chan int)
