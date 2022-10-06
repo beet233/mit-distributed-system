@@ -286,6 +286,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.raftState.wLock()
 	if args.Term > rf.raftState.currentTerm {
+		rf.electionLog("update term and become follower if needed\n")
 		rf.raftState.currentTerm = args.Term
 		rf.raftState.state = followerState
 		rf.raftState.votedFor = -1
@@ -631,9 +632,12 @@ func (rf *Raft) leaderMain() {
 		time.Sleep(time.Millisecond * time.Duration(loopTimeUnit*4))
 
 		// check if state changed by reply
-		if rf.raftState.currentTerm != leaderState {
+		rf.raftState.rLock()
+		if !rf.raftState.isState(leaderState) {
+			rf.raftState.rUnlock()
 			break
 		}
+		rf.raftState.rUnlock()
 	}
 }
 
