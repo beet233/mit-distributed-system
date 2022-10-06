@@ -387,7 +387,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	rf.raftState.rLock()
-	rf.logMutex.Lock()
 	isLeader = rf.raftState.isState(leaderState)
 	if isLeader {
 		rf.logReplicationLog("waiting for leader init...\n")
@@ -395,15 +394,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			time.Sleep(time.Millisecond)
 		}
 		rf.logReplicationLog("append %v into local\n", command)
+		rf.logMutex.Lock()
 		rf.log = append(rf.log, LogEntry{rf.raftState.currentTerm, command})
+		index = len(rf.log) - 1
+		rf.logMutex.Unlock()
 		// broadcast this log
 		// 这里直接 go 出去，这个 Start 需要 immediately return. (毕竟 rs 还锁着，请求的 reply 也可能改变 rs)
 		// 这样有可能发生这样的情况：上一个 Start 加入了 log，还没 send 出去，新的 log 又加入了，然鹅仔细一看，这好像并不会引发错误
 		go rf.sendAppendEntriesToAll()
+	} else {
+		rf.logMutex.RLock()
+		index = len(rf.log) - 1
+		rf.logMutex.RUnlock()
 	}
-	index = len(rf.log) - 1
 	term = rf.raftState.currentTerm
-	rf.logMutex.Unlock()
 	rf.raftState.rUnlock()
 	return index, term, isLeader
 }
