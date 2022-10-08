@@ -396,6 +396,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.logReplicationLog("append %v into local\n", command)
 		rf.logMutex.Lock()
 		rf.log = append(rf.log, LogEntry{rf.raftState.currentTerm, command})
+		rf.matchIndex[rf.me] = len(rf.log) - 1
+		rf.nextIndex[rf.me] = len(rf.log)
 		index = len(rf.log) - 1
 		rf.logMutex.Unlock()
 		// broadcast this log
@@ -527,7 +529,7 @@ func (rf *Raft) tryIncrementCommitIndex() {
 			}
 			if count > len(rf.peers)/2 {
 				rf.commitIndex = i
-				rf.logReplicationLog("input 0 into applyNotifyCh\n")
+				rf.logReplicationLog("most servers has the log %d, input 0 into applyNotifyCh\n", i)
 				rf.applyNotifyCh <- 0
 			}
 		}
@@ -577,6 +579,7 @@ func (rf *Raft) sendAppendEntriesToAll() {
 			if reply.reply.Success {
 				rf.logReplicationLog("server %d append success!\n", reply.from)
 				// update nextIndex and matchIndex
+				rf.logReplicationLog("server %d 's matchIndex update to %d\n", reply.from, reply.args.PrevLogIndex+len(reply.args.Entries))
 				rf.matchIndex[reply.from] = reply.args.PrevLogIndex + len(reply.args.Entries)
 				rf.nextIndex[reply.from] = rf.matchIndex[reply.from] + 1
 				go rf.tryIncrementCommitIndex()
