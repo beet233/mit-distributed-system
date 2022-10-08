@@ -401,6 +401,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// broadcast this log
 		// 这里直接 go 出去，这个 Start 需要 immediately return. (毕竟 rs 还锁着，请求的 reply 也可能改变 rs)
 		// 这样有可能发生这样的情况：上一个 Start 加入了 log，还没 send 出去，新的 log 又加入了，然鹅仔细一看，这好像并不会引发错误
+		rf.electionLog("send out append entries\n")
 		go rf.sendAppendEntriesToAll()
 	} else {
 		rf.logMutex.RLock()
@@ -545,7 +546,7 @@ func (rf *Raft) sendAppendEntriesToAll() {
 		rf.raftState.rLock()
 		rf.logMutex.RLock()
 		if len(rf.log)-1 >= rf.nextIndex[i] {
-			prevLogIndex := len(rf.log) - 1
+			prevLogIndex := len(rf.log) - 2
 			prevLogTerm := rf.log[prevLogIndex].Term
 			args := AppendEntriesArgs{rf.raftState.currentTerm, rf.me, rf.log[rf.nextIndex[i]:], prevLogIndex, prevLogTerm, rf.commitIndex}
 			var reply AppendEntriesReply
@@ -598,6 +599,7 @@ func (rf *Raft) sendAppendEntriesToAll() {
 			}
 		} else {
 			// resend same failed msg for network error
+			rf.logReplicationLog("server %d append failed (for network error) and retry!\n", reply.from)
 			var newReply AppendEntriesReply
 			go rf.sendAppendEntriesWithChannelReply(reply.from, &reply.args, &newReply, replyChannel)
 		}
