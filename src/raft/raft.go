@@ -80,8 +80,11 @@ type Raft struct {
 	// TODO: 这里需不需要锁呢？
 	commitIndex int
 	lastApplied int
-	nextIndex   []int
-	matchIndex  []int
+
+	// 用一个锁管理这俩
+	nextIndex    []int
+	matchIndex   []int
+	peerLogMutex deadlock.RWMutex
 
 	leaderInitDone bool
 
@@ -395,6 +398,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			time.Sleep(time.Millisecond)
 		}
 		rf.logReplicationLog("append %v into local\n", command)
+		rf.peerLogMutex.Lock()
 		rf.logMutex.Lock()
 		rf.logReplicationLog("original log: %v\n", rf.log)
 		rf.log = append(rf.log, LogEntry{rf.raftState.currentTerm, command})
@@ -403,6 +407,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.nextIndex[rf.me] = len(rf.log)
 		index = len(rf.log) - 1
 		rf.logMutex.Unlock()
+		rf.peerLogMutex.Unlock()
 		// broadcast this log
 		// 这里直接 go 出去，这个 Start 需要 immediately return. (毕竟 rs 还锁着，请求的 reply 也可能改变 rs)
 		// 这样有可能发生这样的情况：上一个 Start 加入了 log，还没 send 出去，新的 log 又加入了，然鹅仔细一看，这好像并不会引发错误
@@ -549,6 +554,7 @@ func (rf *Raft) sendAppendEntriesToAll() {
 			continue
 		}
 		rf.raftState.rLock()
+		rf.peerLogMutex.Lock()
 		rf.logMutex.RLock()
 		rf.logReplicationLog("nextIndex[%d] = %d\n", i, rf.nextIndex[i])
 		if len(rf.log)-1 >= rf.nextIndex[i] {
@@ -563,6 +569,7 @@ func (rf *Raft) sendAppendEntriesToAll() {
 			go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
 		}
 		rf.logMutex.RUnlock()
+		rf.peerLogMutex.Unlock()
 		rf.raftState.rUnlock()
 	}
 	// process reply
@@ -595,20 +602,24 @@ func (rf *Raft) sendAppendEntriesToAll() {
 				successCount += 1
 				// update nextIndex and matchIndex
 				rf.logReplicationLog("server %d 's matchIndex update to %d\n", reply.from, reply.args.PrevLogIndex+len(reply.args.Entries))
+				rf.peerLogMutex.Lock()
 				rf.matchIndex[reply.from] = reply.args.PrevLogIndex + len(reply.args.Entries)
 				rf.nextIndex[reply.from] = rf.matchIndex[reply.from] + 1
+				rf.peerLogMutex.Unlock()
 				go rf.tryIncrementCommitIndex()
 			} else {
 				rf.logReplicationLog("server %d append failed and retry!\n", reply.from)
 				// decrement nextIndex and retry
 				// 根据我自己的逻辑判断，prevLogIndex 也是要 -- 的
+				rf.peerLogMutex.Lock()
 				if rf.nextIndex[reply.from] > 0 {
 					rf.nextIndex[reply.from] -= 1
 				}
 				// TODO: 这里的重发并不使用最新的 term 和 leader commit，而是保持原请求的值，只更新prev、entries
 				// TODO: 另外，如果在此期间会有新的 log 进来，这样的情况还未被妥善考虑
 				newArgs := reply.args
-				newArgs.PrevLogIndex -= 1
+				// 将 PrevLogIndex 直接和 nextIndex 绑定而不是简单递减，避免多个 append to all 并发时出现问题
+				newArgs.PrevLogIndex = rf.nextIndex[reply.from] - 1
 				rf.logMutex.RLock()
 				if newArgs.PrevLogIndex >= 0 {
 					newArgs.PrevLogTerm = rf.log[newArgs.PrevLogIndex].Term
@@ -616,6 +627,7 @@ func (rf *Raft) sendAppendEntriesToAll() {
 				newArgs.Entries = rf.log[rf.nextIndex[reply.from]:]
 				rf.logReplicationLog("newArgs | to: %v, prevLogIndex: %v, entries: %v\n", reply.from, newArgs.PrevLogIndex, newArgs.Entries)
 				rf.logMutex.RUnlock()
+				rf.peerLogMutex.Unlock()
 				var newReply AppendEntriesReply
 				go rf.sendAppendEntriesWithChannelReply(reply.from, &newArgs, &newReply, replyChannel)
 			}
@@ -639,7 +651,7 @@ func (rf *Raft) leaderMain() {
 	// 发现有这里还没 init 完，已经有请求 Start 进了这个 leader ，导致 nextIndex 等 state 错误
 	// 添加 leaderInitDone 在 RaftState 中
 	// reinitialize nextIndex and matchIndex
-	// TODO: 是否需要对这几个状态加锁？
+	rf.peerLogMutex.Lock()
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.logMutex.RLock()
@@ -650,6 +662,7 @@ func (rf *Raft) leaderMain() {
 		rf.matchIndex[i] = 0
 	}
 	rf.logMutex.RUnlock()
+	rf.peerLogMutex.Unlock()
 	rf.leaderInitDone = true
 	// 每 40 ms 发送一轮 heartbeat
 	for {
