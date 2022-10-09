@@ -604,6 +604,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			if retry == false {
 				cfg.t.Fatalf("one(%v) failed to reach agreement at retry", cmd)
 			}
+			DPrintf("retry is enabled, and servers failed to agree %v in 2s", cmd)
 		} else {
 			time.Sleep(50 * time.Millisecond)
 		}

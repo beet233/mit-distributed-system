@@ -314,6 +314,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logReplicationLog("log copying...\n")
 		rf.logReplicationLog("original log: %v\n", rf.log)
 		rf.log = rf.log[0 : args.PrevLogIndex+1]
+		rf.logReplicationLog("kept log: %v\n", rf.log)
 		for i := 0; i < len(args.Entries); i++ {
 			rf.log = append(rf.log, args.Entries[i])
 		}
@@ -395,7 +396,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 		rf.logReplicationLog("append %v into local\n", command)
 		rf.logMutex.Lock()
+		rf.logReplicationLog("original log: %v\n", rf.log)
 		rf.log = append(rf.log, LogEntry{rf.raftState.currentTerm, command})
+		rf.logReplicationLog("appended log: %v\n", rf.log)
 		rf.matchIndex[rf.me] = len(rf.log) - 1
 		rf.nextIndex[rf.me] = len(rf.log)
 		index = len(rf.log) - 1
@@ -547,8 +550,13 @@ func (rf *Raft) sendAppendEntriesToAll() {
 		}
 		rf.raftState.rLock()
 		rf.logMutex.RLock()
+		rf.logReplicationLog("nextIndex[%d] = %d\n", i, rf.nextIndex[i])
 		if len(rf.log)-1 >= rf.nextIndex[i] {
-			prevLogIndex := len(rf.log) - 2
+			// 这里的prevLogIndex 定义是 “index of log entry immediately preceding
+			// new ones”，但我实际发送的是从 nextIndex 开始的 Entries，对那个 server 来说从这里开始都是 new ones，
+			// 所以也应该让 prevLogIndex 为 nextIndex -1
+			// prevLogIndex := len(rf.log) - 2
+			prevLogIndex := rf.nextIndex[i] - 1
 			prevLogTerm := rf.log[prevLogIndex].Term
 			args := AppendEntriesArgs{rf.raftState.currentTerm, rf.me, rf.log[rf.nextIndex[i]:], prevLogIndex, prevLogTerm, rf.commitIndex}
 			var reply AppendEntriesReply
@@ -558,7 +566,13 @@ func (rf *Raft) sendAppendEntriesToAll() {
 		rf.raftState.rUnlock()
 	}
 	// process reply
+	successCount := 0
 	for {
+		// TODO: 这里的问题：无限重试什么时候停？
+		if successCount == len(rf.peers)-1 {
+			// all success
+			break
+		}
 		rf.raftState.rLock()
 		if rf.raftState.currentTerm > thisTerm || rf.raftState.state != leaderState {
 			rf.raftState.rUnlock()
@@ -578,6 +592,7 @@ func (rf *Raft) sendAppendEntriesToAll() {
 			// TODO: check this part
 			if reply.reply.Success {
 				rf.logReplicationLog("server %d append success!\n", reply.from)
+				successCount += 1
 				// update nextIndex and matchIndex
 				rf.logReplicationLog("server %d 's matchIndex update to %d\n", reply.from, reply.args.PrevLogIndex+len(reply.args.Entries))
 				rf.matchIndex[reply.from] = reply.args.PrevLogIndex + len(reply.args.Entries)
@@ -586,16 +601,20 @@ func (rf *Raft) sendAppendEntriesToAll() {
 			} else {
 				rf.logReplicationLog("server %d append failed and retry!\n", reply.from)
 				// decrement nextIndex and retry
-				// 根据我自己的逻辑判断，prevLog 也是要 -- 的
+				// 根据我自己的逻辑判断，prevLogIndex 也是要 -- 的
 				if rf.nextIndex[reply.from] > 0 {
 					rf.nextIndex[reply.from] -= 1
 				}
+				// TODO: 这里的重发并不使用最新的 term 和 leader commit，而是保持原请求的值，只更新prev、entries
+				// TODO: 另外，如果在此期间会有新的 log 进来，这样的情况还未被妥善考虑
 				newArgs := reply.args
 				newArgs.PrevLogIndex -= 1
 				rf.logMutex.RLock()
 				if newArgs.PrevLogIndex >= 0 {
 					newArgs.PrevLogTerm = rf.log[newArgs.PrevLogIndex].Term
 				}
+				newArgs.Entries = rf.log[rf.nextIndex[reply.from]:]
+				rf.logReplicationLog("newArgs | to: %v, prevLogIndex: %v, entries: %v\n", reply.from, newArgs.PrevLogIndex, newArgs.Entries)
 				rf.logMutex.RUnlock()
 				var newReply AppendEntriesReply
 				go rf.sendAppendEntriesWithChannelReply(reply.from, &newArgs, &newReply, replyChannel)
@@ -840,6 +859,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rand.Seed(time.Nanosecond.Nanoseconds())
 
 	// start ticker goroutine to start elections
 	// go rf.ticker()
