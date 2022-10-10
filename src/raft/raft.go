@@ -413,7 +413,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// 这里直接 go 出去，这个 Start 需要 immediately return. (毕竟 rs 还锁着，请求的 reply 也可能改变 rs)
 		// 这样有可能发生这样的情况：上一个 Start 加入了 log，还没 send 出去，新的 log 又加入了，然鹅仔细一看，这好像并不会引发错误
 		rf.electionLog("send out append entries\n")
-		go rf.sendAppendEntriesToAll()
+		go rf.sendAppendEntriesToAll(rf.raftState.currentTerm)
 	} else {
 		rf.logMutex.RLock()
 		index = len(rf.log) - 1
@@ -545,18 +545,14 @@ func (rf *Raft) tryIncrementCommitIndex() {
 	}
 }
 
-func (rf *Raft) sendAppendEntriesToAll() {
-	rf.raftState.rLock()
-	thisTerm := rf.raftState.currentTerm
-	rf.raftState.rUnlock()
+func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 	replyChannel := make(chan WrappedAppendEntriesReply, 10)
+	rf.peerLogMutex.Lock()
+	rf.logMutex.RLock()
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		rf.raftState.rLock()
-		rf.peerLogMutex.Lock()
-		rf.logMutex.RLock()
 		rf.logReplicationLog("nextIndex[%d] = %d\n", i, rf.nextIndex[i])
 		if len(rf.log)-1 >= rf.nextIndex[i] {
 			// 这里的prevLogIndex 定义是 “index of log entry immediately preceding
@@ -565,14 +561,13 @@ func (rf *Raft) sendAppendEntriesToAll() {
 			// prevLogIndex := len(rf.log) - 2
 			prevLogIndex := rf.nextIndex[i] - 1
 			prevLogTerm := rf.log[prevLogIndex].Term
-			args := AppendEntriesArgs{rf.raftState.currentTerm, rf.me, rf.log[rf.nextIndex[i]:], prevLogIndex, prevLogTerm, rf.commitIndex}
+			args := AppendEntriesArgs{thisTerm, rf.me, rf.log[rf.nextIndex[i]:], prevLogIndex, prevLogTerm, rf.commitIndex}
 			var reply AppendEntriesReply
 			go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
 		}
-		rf.logMutex.RUnlock()
-		rf.peerLogMutex.Unlock()
-		rf.raftState.rUnlock()
 	}
+	rf.logMutex.RUnlock()
+	rf.peerLogMutex.Unlock()
 	// process reply
 	successCount := 0
 	for {
