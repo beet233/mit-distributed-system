@@ -257,6 +257,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.electionLog("vote for %d\n", args.CandidateId)
 				reply.VoteGranted = true
 				rf.raftState.votedFor = args.CandidateId
+				rf.raftState.resetElectionTimer = true
 			} else {
 				rf.electionLog("refuse to vote for %d\n", args.CandidateId)
 			}
@@ -580,7 +581,7 @@ func (rf *Raft) sendAppendEntriesToAll() {
 			// all success
 			break
 		}
-		// TODO: 有没有一种可能，这里是不应有的，不然像最新的FailNoAgree2B_2.txt一样，某人当 leader 时发出去了 append，但还没收就不是 leader 了，那这条命令就不会被提交，除非后来某个复制成功的 server 成了 Leader 并收到新的日志，顺带提交了这条
+		// TODO: 有没有一种可能，这里是不应有的，不然像最新的FailNoAgree2B_2.txt（logUncertainFailNoAgree）一样，某人当 leader 时发出去了 append，但还没收就不是 leader 了，那这条命令就不会被提交，除非后来某个复制成功的 server 成了 Leader 并收到新的日志，顺带提交了这条
 		// TODO: 但其实这样看来，这条命令本就应该失败
 		rf.raftState.rLock()
 		if rf.raftState.currentTerm > thisTerm || rf.raftState.state != leaderState {
