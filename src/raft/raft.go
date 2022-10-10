@@ -580,6 +580,8 @@ func (rf *Raft) sendAppendEntriesToAll() {
 			// all success
 			break
 		}
+		// TODO: 有没有一种可能，这里是不应有的，不然像最新的FailNoAgree2B_2.txt一样，某人当 leader 时发出去了 append，但还没收就不是 leader 了，那这条命令就不会被提交，除非后来某个复制成功的 server 成了 Leader 并收到新的日志，顺带提交了这条
+		// TODO: 但其实这样看来，这条命令本就应该失败
 		rf.raftState.rLock()
 		if rf.raftState.currentTerm > thisTerm || rf.raftState.state != leaderState {
 			rf.raftState.rUnlock()
@@ -589,8 +591,10 @@ func (rf *Raft) sendAppendEntriesToAll() {
 		reply := <-replyChannel
 		if reply.ok {
 			rf.electionLog("get AppendEntries reply from server %d\n", reply.from)
+			leaderTermSmaller := false
 			rf.raftState.wLock()
 			if reply.reply.Term > rf.raftState.currentTerm {
+				leaderTermSmaller = true
 				rf.electionLog("turn into follower for term update\n")
 				rf.raftState.currentTerm = reply.reply.Term
 				rf.raftState.state = followerState
@@ -607,12 +611,13 @@ func (rf *Raft) sendAppendEntriesToAll() {
 				rf.nextIndex[reply.from] = rf.matchIndex[reply.from] + 1
 				rf.peerLogMutex.Unlock()
 				go rf.tryIncrementCommitIndex()
-			} else {
+			} else if !leaderTermSmaller {
+				// 只有在 log inconsistent 时重发，term 问题不用重发
 				rf.logReplicationLog("server %d append failed and retry!\n", reply.from)
 				// decrement nextIndex and retry
 				// 根据我自己的逻辑判断，prevLogIndex 也是要 -- 的
 				rf.peerLogMutex.Lock()
-				if rf.nextIndex[reply.from] > 0 {
+				if rf.nextIndex[reply.from] > 1 {
 					rf.nextIndex[reply.from] -= 1
 				}
 				// TODO: 这里的重发并不使用最新的 term 和 leader commit，而是保持原请求的值，只更新prev、entries
@@ -873,7 +878,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	rand.Seed(time.Nanosecond.Nanoseconds())
+	seed := time.Now().UnixNano()
+	rand.Seed(seed)
+	rf.electionLog("rand seed: %v\n", seed)
 
 	// start ticker goroutine to start elections
 	// go rf.ticker()
