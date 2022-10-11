@@ -474,25 +474,20 @@ type WrappedAppendEntriesReply struct {
 // 但是心跳的 reply 处理还是要做的，问题是怎么退出？答：计数，全都返回了或失败了就退出
 // 这里的问题就是，如果上一条日志还没有 commit ，下一条命令就发过来了，raft 应该怎么做？
 
-func (rf *Raft) sendHeartbeatToAll() {
-	rf.raftState.rLock()
-	thisTerm := rf.raftState.currentTerm
-	rf.raftState.rUnlock()
+func (rf *Raft) sendHeartbeatToAll(thisTerm int) {
 	replyChannel := make(chan WrappedAppendEntriesReply, 10)
+	rf.logMutex.RLock()
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		rf.raftState.rLock()
-		rf.logMutex.RLock()
 		prevLogIndex := len(rf.log) - 1
 		prevLogTerm := rf.log[prevLogIndex].Term
-		args := AppendEntriesArgs{rf.raftState.currentTerm, rf.me, nil, prevLogIndex, prevLogTerm, rf.commitIndex}
-		rf.logMutex.RUnlock()
-		rf.raftState.rUnlock()
+		args := AppendEntriesArgs{thisTerm, rf.me, nil, prevLogIndex, prevLogTerm, rf.commitIndex}
 		var reply AppendEntriesReply
 		go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
 	}
+	rf.logMutex.RUnlock()
 	// process reply
 	replyCount := 0
 	for {
@@ -669,7 +664,9 @@ func (rf *Raft) leaderMain() {
 	for {
 		// send heartbeat to all servers
 		rf.electionLog("send out heartbeats\n")
-		go rf.sendHeartbeatToAll()
+		rf.raftState.rLock()
+		go rf.sendHeartbeatToAll(rf.raftState.currentTerm)
+		rf.raftState.rUnlock()
 
 		time.Sleep(time.Millisecond * time.Duration(loopTimeUnit*4))
 
@@ -856,8 +853,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.electionDebug = true
-	rf.logReplicationDebug = true
+	rf.electionDebug = false
+	rf.logReplicationDebug = false
 	rf.raftState = MakeRaftState(rf)
 	// log[0] is unused, just to start at 1.
 	rf.log = make([]LogEntry, 1)
