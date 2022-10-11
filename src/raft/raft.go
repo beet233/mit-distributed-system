@@ -245,7 +245,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			// 怎么判断 candidate 是不是至少比 “我” 新？我有可能比它的 Log 少，而且我可能以前当过失败的 leader ，有着它没有的 Log，这个还挺有意思，可以在文档补充
 			isNewerThanMe := false
 			rf.logMutex.RLock()
-			if len(rf.log) == 0 || args.LastLogTerm > rf.log[len(rf.log)-1].Term {
+			if len(rf.log) == 1 || args.LastLogTerm > rf.log[len(rf.log)-1].Term {
 				isNewerThanMe = true
 			} else if args.LastLogTerm == rf.log[len(rf.log)-1].Term {
 				if args.LastLogIndex >= len(rf.log)-1 {
