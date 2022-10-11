@@ -295,7 +295,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.raftState.state = followerState
 		rf.raftState.votedFor = -1
 	}
-	if rf.raftState.state == candidateState {
+	if rf.raftState.state == candidateState && args.Term >= rf.raftState.currentTerm {
 		rf.electionLog("turn into follower from candidate\n")
 		rf.raftState.state = followerState
 	}
