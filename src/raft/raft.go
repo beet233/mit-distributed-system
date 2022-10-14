@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
@@ -97,6 +99,7 @@ type Raft struct {
 	// some log flags with wrapped log func
 	electionDebug       bool
 	logReplicationDebug bool
+	persistenceDebug    bool
 }
 
 // return currentTerm and whether this server
@@ -146,20 +149,34 @@ func (rf *Raft) logReplicationLog(format string, vars ...interface{}) {
 	}
 }
 
+func (rf *Raft) persistenceLog(format string, vars ...interface{}) {
+	if rf.persistenceDebug {
+		rf.logWithRaftStatus(format, vars...)
+	}
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
+// 内部不锁，外部来锁
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
+	rf.persistenceLog("persist states and logs\n")
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	e.Encode(rf.raftState.currentTerm)
+	e.Encode(rf.raftState.votedFor)
+	e.Encode(len(rf.log))
+	for _, entry := range rf.log {
+		e.Encode(entry)
+	}
+	//e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -171,17 +188,29 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logLength int
+	var logEntries []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logLength) != nil {
+		log.Fatalln("failed deserialization of term or votedFor or logLength.")
+	} else {
+		rf.persistenceLog("log length: %d\n", logLength)
+		// decode log
+		logEntries = make([]LogEntry, logLength)
+		for i := 0; i < logLength; i++ {
+			if d.Decode(&logEntries[i]) != nil {
+				log.Fatalln("failed deserialization of log.")
+			}
+		}
+		rf.raftState.currentTerm = currentTerm
+		rf.raftState.votedFor = votedFor
+		rf.log = logEntries
+	}
 }
 
 //
@@ -239,6 +268,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.raftState.currentTerm = args.Term
 			rf.raftState.votedFor = -1
 			rf.raftState.state = followerState
+			rf.logMutex.RLock()
+			rf.persist()
+			rf.logMutex.RUnlock()
 		}
 		if rf.raftState.votedFor == -1 || rf.raftState.votedFor == args.CandidateId {
 			// if candidate's log is at least as up-to-date as mine, then grant vote
@@ -258,6 +290,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				reply.VoteGranted = true
 				rf.raftState.votedFor = args.CandidateId
 				rf.raftState.resetElectionTimer = true
+				rf.logMutex.RLock()
+				rf.persist()
+				rf.logMutex.RUnlock()
 			} else {
 				rf.electionLog("refuse to vote for %d\n", args.CandidateId)
 			}
@@ -289,11 +324,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logReplicationLog("recv AppendEntries from %d\n", args.LeaderId)
 	}
 	rf.raftState.wLock()
+	rf.logMutex.Lock()
 	if args.Term > rf.raftState.currentTerm {
 		rf.electionLog("update term and become follower if needed\n")
 		rf.raftState.currentTerm = args.Term
 		rf.raftState.state = followerState
 		rf.raftState.votedFor = -1
+		rf.persist()
 	}
 	if rf.raftState.state == candidateState && args.Term >= rf.raftState.currentTerm {
 		rf.electionLog("turn into follower from candidate\n")
@@ -305,11 +342,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	if args.Term < rf.raftState.currentTerm {
 		reply.Success = false
+		rf.logMutex.Unlock()
 		rf.raftState.wUnlock()
 		return
 	}
 	if args.PrevLogIndex > len(rf.log)-1 || (args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		reply.Success = false
+		rf.logMutex.Unlock()
 		rf.raftState.wUnlock()
 		return
 	}
@@ -323,6 +362,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = append(rf.log, args.Entries[i])
 		}
 		rf.logReplicationLog("appended log: %v\n", rf.log)
+		rf.persist()
 	}
 	if args.LeaderCommit > rf.commitIndex {
 		if args.LeaderCommit < len(rf.log)-1 {
@@ -333,6 +373,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logReplicationLog("input 0 into applyNotifyCh\n")
 		rf.applyNotifyCh <- 0
 	}
+	rf.logMutex.Unlock()
 	rf.raftState.wUnlock()
 }
 
@@ -404,6 +445,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.logReplicationLog("original log: %v\n", rf.log)
 		rf.log = append(rf.log, LogEntry{rf.raftState.currentTerm, command})
 		rf.logReplicationLog("appended log: %v\n", rf.log)
+		rf.persist()
 		rf.matchIndex[rf.me] = len(rf.log) - 1
 		rf.nextIndex[rf.me] = len(rf.log)
 		index = len(rf.log) - 1
@@ -510,6 +552,9 @@ func (rf *Raft) sendHeartbeatToAll(thisTerm int) {
 				rf.electionLog("turn into follower for term update\n")
 				rf.raftState.currentTerm = reply.reply.Term
 				rf.raftState.state = followerState
+				rf.logMutex.RLock()
+				rf.persist()
+				rf.logMutex.RUnlock()
 			}
 			rf.raftState.wUnlock()
 		}
@@ -589,6 +634,9 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 				rf.electionLog("turn into follower for term update\n")
 				rf.raftState.currentTerm = reply.reply.Term
 				rf.raftState.state = followerState
+				rf.logMutex.RLock()
+				rf.persist()
+				rf.logMutex.RUnlock()
 			}
 			rf.raftState.wUnlock()
 			// TODO: check this part
@@ -722,6 +770,9 @@ func (rf *Raft) sendRequestVoteToAll() {
 				rf.electionLog("turn into follower for term update\n")
 				rf.raftState.currentTerm = reply.reply.Term
 				rf.raftState.state = followerState
+				rf.logMutex.RLock()
+				rf.persist()
+				rf.logMutex.RUnlock()
 			}
 			if reply.reply.VoteGranted {
 				grantedVoteSum += 1
@@ -751,6 +802,9 @@ func (rf *Raft) doElection() {
 	rf.raftState.wLock()
 	rf.raftState.currentTerm += 1
 	rf.raftState.votedFor = rf.me
+	rf.logMutex.RLock()
+	rf.persist()
+	rf.logMutex.RUnlock()
 	rf.raftState.wUnlock()
 	// send out request vote rpc
 	go rf.sendRequestVoteToAll()
@@ -853,8 +907,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.electionDebug = false
-	rf.logReplicationDebug = false
+	rf.electionDebug = true
+	rf.logReplicationDebug = true
+	rf.persistenceDebug = true
 	rf.raftState = MakeRaftState(rf)
 	// log[0] is unused, just to start at 1.
 	rf.log = make([]LogEntry, 1)
