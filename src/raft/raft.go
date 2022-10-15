@@ -134,7 +134,7 @@ func (rf *Raft) logWithRaftStatus(format string, vars ...interface{}) {
 		break
 	}
 	rightHalf := fmt.Sprintf(format, vars...)
-	log.Printf("server %d %s in term %d votedFor %d commitIndex %d | %s", rf.me, stateString, rf.raftState.currentTerm, rf.raftState.votedFor, rf.commitIndex, rightHalf)
+	log.Printf("server %d %s in term %d votedFor %d commitIndex %d lastApplied %d | %s", rf.me, stateString, rf.raftState.currentTerm, rf.raftState.votedFor, rf.commitIndex, rf.lastApplied, rightHalf)
 }
 
 func (rf *Raft) electionLog(format string, vars ...interface{}) {
@@ -435,8 +435,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.raftState.rLock()
 	isLeader = rf.raftState.isState(leaderState)
 	if isLeader {
-		rf.logReplicationLog("waiting for leader init...\n")
+		//rf.logReplicationLog("waiting for leader init...\n")
 		for !rf.leaderInitDone {
+			rf.logReplicationLog("waiting for leader init...\n")
 			time.Sleep(time.Millisecond)
 		}
 		rf.logReplicationLog("append %v into local\n", command)
@@ -562,21 +563,24 @@ func (rf *Raft) sendHeartbeatToAll(thisTerm int) {
 }
 
 func (rf *Raft) tryIncrementCommitIndex() {
-	for i := rf.commitIndex + 1; ; i++ {
-		rf.logMutex.RLock()
-		if i > len(rf.log)-1 {
-			rf.logMutex.RUnlock()
-			break
-		}
-		rf.logMutex.RUnlock()
-		if rf.log[i].Term == rf.raftState.currentTerm {
+	rf.raftState.rLock()
+	rf.logMutex.RLock()
+	thisLogLength := len(rf.log)
+	thisTerm := rf.raftState.currentTerm
+	thisCommitIndex := rf.commitIndex
+	rf.logMutex.RUnlock()
+	rf.raftState.rUnlock()
+	for i := thisCommitIndex + 1; i < thisLogLength; i++ {
+		if rf.log[i].Term == thisTerm {
 			count := 0
+			rf.peerLogMutex.RLock()
 			for j := 0; j < len(rf.peers); j++ {
 				if rf.matchIndex[j] >= i {
 					count += 1
 				}
 			}
-			if count > len(rf.peers)/2 {
+			rf.peerLogMutex.RUnlock()
+			if count > len(rf.peers)/2 && i > rf.commitIndex {
 				rf.commitIndex = i
 				rf.logReplicationLog("most servers has the log %d, input 0 into applyNotifyCh\n", i)
 				rf.applyNotifyCh <- 0
@@ -872,18 +876,28 @@ func (rf *Raft) applyLoop() {
 		if rf.commitIndex > rf.lastApplied {
 			nextApplied := rf.lastApplied + 1
 			toBeApplied := rf.log[nextApplied : rf.commitIndex+1]
+			rf.logReplicationLog("to be applied (from index %v): %v\n", nextApplied, toBeApplied)
 			// send to channel
-			go func(nextApplied int, toBeApplied *[]LogEntry) {
-				for i, entry := range *toBeApplied {
-					rf.applyCh <- ApplyMsg{
-						Command:      entry.Command,
-						CommandValid: true,
-						CommandIndex: i + nextApplied,
-					}
+			// 注意！！！这里有可能会乱 go，导致顺序错误
+			//go func(nextApplied int, toBeApplied *[]LogEntry) {
+			//	for i, entry := range *toBeApplied {
+			//		rf.applyCh <- ApplyMsg{
+			//			Command:      entry.Command,
+			//			CommandValid: true,
+			//			CommandIndex: i + nextApplied,
+			//		}
+			//	}
+			//}(nextApplied, &toBeApplied)
+			for i, entry := range toBeApplied {
+				rf.applyCh <- ApplyMsg{
+					Command:      entry.Command,
+					CommandValid: true,
+					CommandIndex: i + nextApplied,
 				}
-			}(nextApplied, &toBeApplied)
-			rf.logReplicationLog("apply %d entries to state machine\n", len(toBeApplied))
+			}
+			rf.logReplicationLog("apply %d entries (from index %v) to state machine\n", len(toBeApplied), nextApplied)
 			rf.lastApplied += len(toBeApplied)
+			rf.logReplicationLog("latest lastApplied: %d\n", rf.lastApplied)
 		}
 	}
 }
@@ -924,6 +938,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyNotifyCh = make(chan int)
 
 	// initialize from state persisted before a crash
+	rf.persistenceLog("remake and readPersist\n")
 	rf.readPersist(persister.ReadRaftState())
 
 	seed := time.Now().UnixNano()
