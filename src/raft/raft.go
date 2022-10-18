@@ -79,8 +79,9 @@ type Raft struct {
 
 	log      []LogEntry
 	logMutex deadlock.RWMutex
-	// TODO: 这里需不需要锁呢？
+
 	commitIndex int
+	commitMutex deadlock.RWMutex
 	lastApplied int
 
 	// 用一个锁管理这俩
@@ -341,12 +342,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.raftState.currentTerm
 	reply.Success = true
 	if args.Term < rf.raftState.currentTerm {
+		rf.logReplicationLog("server %d 's term is old, return false\n", args.LeaderId)
 		reply.Success = false
 		rf.logMutex.Unlock()
 		rf.raftState.wUnlock()
 		return
 	}
 	if args.PrevLogIndex > len(rf.log)-1 || (args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+		rf.logReplicationLog("server %d 's prev log not match, return false\n", args.LeaderId)
 		reply.Success = false
 		rf.logMutex.Unlock()
 		rf.raftState.wUnlock()
@@ -364,6 +367,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logReplicationLog("appended log: %v\n", rf.log)
 		rf.persist()
 	}
+	rf.commitMutex.Lock()
 	if args.LeaderCommit > rf.commitIndex {
 		if args.LeaderCommit < len(rf.log)-1 {
 			rf.commitIndex = args.LeaderCommit
@@ -373,6 +377,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logReplicationLog("input 0 into applyNotifyCh\n")
 		rf.applyNotifyCh <- 0
 	}
+	rf.commitMutex.Unlock()
 	rf.logMutex.Unlock()
 	rf.raftState.wUnlock()
 }
@@ -455,7 +460,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// broadcast this log
 		// 这里直接 go 出去，这个 Start 需要 immediately return. (毕竟 rs 还锁着，请求的 reply 也可能改变 rs)
 		// 这样有可能发生这样的情况：上一个 Start 加入了 log，还没 send 出去，新的 log 又加入了，然鹅仔细一看，这好像并不会引发错误
-		rf.electionLog("send out append entries\n")
+		rf.logReplicationLog("send out append entries\n")
 		go rf.sendAppendEntriesToAll(rf.raftState.currentTerm)
 	} else {
 		rf.logMutex.RLock()
@@ -526,7 +531,9 @@ func (rf *Raft) sendHeartbeatToAll(thisTerm int) {
 		}
 		prevLogIndex := len(rf.log) - 1
 		prevLogTerm := rf.log[prevLogIndex].Term
+		rf.commitMutex.RLock()
 		args := AppendEntriesArgs{thisTerm, rf.me, nil, prevLogIndex, prevLogTerm, rf.commitIndex}
+		rf.commitMutex.RUnlock()
 		var reply AppendEntriesReply
 		go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
 	}
@@ -565,13 +572,18 @@ func (rf *Raft) sendHeartbeatToAll(thisTerm int) {
 func (rf *Raft) tryIncrementCommitIndex() {
 	rf.raftState.rLock()
 	rf.logMutex.RLock()
+	rf.commitMutex.RLock()
 	thisLogLength := len(rf.log)
 	thisTerm := rf.raftState.currentTerm
 	thisCommitIndex := rf.commitIndex
+	rf.commitMutex.RUnlock()
 	rf.logMutex.RUnlock()
 	rf.raftState.rUnlock()
 	for i := thisCommitIndex + 1; i < thisLogLength; i++ {
-		if rf.log[i].Term == thisTerm {
+		rf.logMutex.RLock()
+		nowLogTerm := rf.log[i].Term
+		rf.logMutex.RUnlock()
+		if nowLogTerm == thisTerm {
 			count := 0
 			rf.peerLogMutex.RLock()
 			for j := 0; j < len(rf.peers); j++ {
@@ -580,11 +592,13 @@ func (rf *Raft) tryIncrementCommitIndex() {
 				}
 			}
 			rf.peerLogMutex.RUnlock()
+			rf.commitMutex.Lock()
 			if count > len(rf.peers)/2 && i > rf.commitIndex {
 				rf.commitIndex = i
 				rf.logReplicationLog("most servers has the log %d, input 0 into applyNotifyCh\n", i)
 				rf.applyNotifyCh <- 0
 			}
+			rf.commitMutex.Unlock()
 		}
 	}
 }
@@ -605,7 +619,9 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 			// prevLogIndex := len(rf.log) - 2
 			prevLogIndex := rf.nextIndex[i] - 1
 			prevLogTerm := rf.log[prevLogIndex].Term
+			rf.commitMutex.RLock()
 			args := AppendEntriesArgs{thisTerm, rf.me, rf.log[rf.nextIndex[i]:], prevLogIndex, prevLogTerm, rf.commitIndex}
+			rf.commitMutex.RUnlock()
 			var reply AppendEntriesReply
 			go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
 		}
@@ -630,7 +646,7 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 		rf.raftState.rUnlock()
 		reply := <-replyChannel
 		if reply.ok {
-			rf.electionLog("get AppendEntries reply from server %d\n", reply.from)
+			rf.logReplicationLog("get AppendEntries reply from server %d\n", reply.from)
 			leaderTermSmaller := false
 			rf.raftState.wLock()
 			if reply.reply.Term > rf.raftState.currentTerm {
@@ -653,6 +669,7 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 				rf.matchIndex[reply.from] = reply.args.PrevLogIndex + len(reply.args.Entries)
 				rf.nextIndex[reply.from] = rf.matchIndex[reply.from] + 1
 				rf.peerLogMutex.Unlock()
+				// 每有成功的 AppendEntries 返回时，就尝试一下 commit 以及 apply
 				go rf.tryIncrementCommitIndex()
 			} else if !leaderTermSmaller {
 				// 只有在 log inconsistent 时重发，term 问题不用重发
@@ -921,7 +938,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.electionDebug = true
+	rf.electionDebug = false
 	rf.logReplicationDebug = true
 	rf.persistenceDebug = true
 	rf.raftState = MakeRaftState(rf)
