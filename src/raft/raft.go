@@ -313,8 +313,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term                int
+	Success             bool
+	NextRetryStartIndex int
 }
 
 // AppendEntries RPC handler
@@ -351,6 +352,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex > len(rf.log)-1 || (args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		rf.logReplicationLog("server %d 's prev log not match, return false\n", args.LeaderId)
 		reply.Success = false
+		if args.PrevLogIndex > len(rf.log)-1 {
+			reply.NextRetryStartIndex = len(rf.log)
+		} else {
+			conflictTerm := rf.log[args.PrevLogIndex].Term
+			tempIndex := args.PrevLogIndex
+			if tempIndex == 0 {
+				log.Fatalf("ERROR: log[0]'s term conflict???\n")
+			}
+			for tempIndex > 1 && rf.log[tempIndex].Term == conflictTerm {
+				tempIndex -= 1
+			}
+			reply.NextRetryStartIndex = tempIndex
+		}
 		rf.logMutex.Unlock()
 		rf.raftState.wUnlock()
 		return
@@ -636,19 +650,17 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 			// all success
 			break
 		}
-		// TODO: 有没有一种可能，这里是不应有的，不然像最新的FailNoAgree2B_2.txt（logUncertainFailNoAgree）一样，某人当 leader 时发出去了 append，但还没收就不是 leader 了，那这条命令就不会被提交，除非后来某个复制成功的 server 成了 Leader 并收到新的日志，顺带提交了这条
-		// TODO: 但其实这样看来，这条命令本就应该失败
-		rf.raftState.rLock()
+		// 这里等待中途，完全有可能发生状态的改变
+		reply := <-replyChannel
+		// 所以这里再判断一次，并且只有在提前判断&&锁住raftState的情况下，我们才能保证leaderTermSmaller这个bool的正确性
+		rf.raftState.wLock()
 		if rf.raftState.currentTerm > thisTerm || rf.raftState.state != leaderState {
-			rf.raftState.rUnlock()
+			rf.raftState.wUnlock()
 			break
 		}
-		rf.raftState.rUnlock()
-		reply := <-replyChannel
 		if reply.ok {
 			rf.logReplicationLog("get AppendEntries reply from server %d\n", reply.from)
 			leaderTermSmaller := false
-			rf.raftState.wLock()
 			if reply.reply.Term > rf.raftState.currentTerm {
 				leaderTermSmaller = true
 				rf.electionLog("turn into follower for term update\n")
@@ -658,7 +670,6 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 				rf.persist()
 				rf.logMutex.RUnlock()
 			}
-			rf.raftState.wUnlock()
 			// TODO: check this part
 			if reply.reply.Success {
 				rf.logReplicationLog("server %d append success!\n", reply.from)
@@ -677,9 +688,13 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 				// decrement nextIndex and retry
 				// 根据我自己的逻辑判断，prevLogIndex 也是要 -- 的
 				rf.peerLogMutex.Lock()
-				if rf.nextIndex[reply.from] > 1 {
-					rf.nextIndex[reply.from] -= 1
+				//if rf.nextIndex[reply.from] > 1 {
+				//	rf.nextIndex[reply.from] -= 1
+				//}
+				if reply.reply.NextRetryStartIndex == 0 {
+					log.Fatalf("ERROR: NextRetryStartIndex is 0!!\n")
 				}
+				rf.nextIndex[reply.from] = reply.reply.NextRetryStartIndex
 				// TODO: 这里的重发并不使用最新的 term 和 leader commit，而是保持原请求的值，只更新prev、entries
 				// TODO: 另外，如果在此期间会有新的 log 进来，这样的情况还未被妥善考虑
 				newArgs := reply.args
@@ -702,6 +717,7 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 			var newReply AppendEntriesReply
 			go rf.sendAppendEntriesWithChannelReply(reply.from, &reply.args, &newReply, replyChannel)
 		}
+		rf.raftState.wUnlock()
 	}
 }
 
