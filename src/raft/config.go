@@ -157,7 +157,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 }
 
 // applier reads message from apply ch and checks that they match the log
-// contents
+// contents, i stand for a server's index
 func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 	for m := range applyCh {
 		if m.CommandValid == false {
@@ -505,7 +505,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 		cmd1, ok := cfg.logs[i][index]
 		cfg.mu.Unlock()
 
-		cfg.t.Logf("server %d | ok: %v, cmd1: %v", i, ok, cmd1)
+		//cfg.t.Logf("server %d | ok: %v, cmd1: %v", i, ok, cmd1)
 
 		if ok {
 			if count > 0 && cmd != cmd1 {

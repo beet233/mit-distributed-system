@@ -89,7 +89,8 @@ type Raft struct {
 	matchIndex   []int
 	peerLogMutex deadlock.RWMutex
 
-	leaderInitDone bool
+	leaderInitDone  bool
+	leaderInitMutex deadlock.Mutex
 
 	// apply notify channel
 	applyNotifyCh chan int
@@ -135,7 +136,7 @@ func (rf *Raft) logWithRaftStatus(format string, vars ...interface{}) {
 		break
 	}
 	rightHalf := fmt.Sprintf(format, vars...)
-	log.Printf("server %d %s in term %d votedFor %d commitIndex %d lastApplied %d | %s", rf.me, stateString, rf.raftState.currentTerm, rf.raftState.votedFor, rf.commitIndex, rf.lastApplied, rightHalf)
+	log.Printf("server %d %s in term %d votedFor %d commitIndex %d lastApplied %d leaderInitDone %v | %s", rf.me, stateString, rf.raftState.currentTerm, rf.raftState.votedFor, rf.commitIndex, rf.lastApplied, rf.leaderInitDone, rightHalf)
 }
 
 func (rf *Raft) electionLog(format string, vars ...interface{}) {
@@ -371,13 +372,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if args.Entries != nil {
 		// 直接把新的都 append 进去
+		// 这里原来不对，当并发比较高的时候，如果出现更长的 log 比更短的 log 的请求更早来，更短的 log 会把后面的给吞掉，更长的就没了
 		rf.logReplicationLog("log copying...\n")
 		rf.logReplicationLog("original log: %v\n", rf.log)
-		rf.log = rf.log[0 : args.PrevLogIndex+1]
-		rf.logReplicationLog("kept log: %v\n", rf.log)
 		for i := 0; i < len(args.Entries); i++ {
-			rf.log = append(rf.log, args.Entries[i])
+			if args.PrevLogIndex+1+i > len(rf.log)-1 {
+				rf.log = append(rf.log, args.Entries[i])
+			} else if rf.log[args.PrevLogIndex+1+i].Term != args.Entries[i].Term {
+				rf.log = rf.log[0 : args.PrevLogIndex+1+i]
+				rf.log = append(rf.log, args.Entries[i])
+			}
 		}
+		//rf.log = rf.log[0 : args.PrevLogIndex+1]
+		//rf.logReplicationLog("kept log: %v\n", rf.log)
+		//for i := 0; i < len(args.Entries); i++ {
+		//	rf.log = append(rf.log, args.Entries[i])
+		//}
 		rf.logReplicationLog("appended log: %v\n", rf.log)
 		rf.persist()
 	}
@@ -455,9 +465,28 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = rf.raftState.isState(leaderState)
 	if isLeader {
 		//rf.logReplicationLog("waiting for leader init...\n")
-		for !rf.leaderInitDone {
+		for {
+			rf.leaderInitMutex.Lock()
+			if rf.leaderInitDone {
+				rf.leaderInitMutex.Unlock()
+				break
+			}
+			rf.leaderInitMutex.Unlock()
 			rf.logReplicationLog("waiting for leader init...\n")
-			time.Sleep(time.Millisecond)
+			// 注意！这里有可能刚成为 leader ，甚至没去过 leaderMain，Start就来了，导致根本没机会init
+			// 睡眠等待时释放锁，防死锁
+			rf.raftState.rUnlock()
+			time.Sleep(time.Millisecond * time.Duration(2))
+			rf.raftState.rLock()
+			if !rf.raftState.isState(leaderState) {
+				rf.logReplicationLog("while waiting for leader init in Start, server role has changed\n")
+				isLeader = false
+				term = rf.raftState.currentTerm
+				rf.logMutex.RLock()
+				index = len(rf.log) - 1
+				rf.logMutex.RUnlock()
+				return index, term, isLeader
+			}
 		}
 		rf.logReplicationLog("append %v into local\n", command)
 		rf.peerLogMutex.Lock()
@@ -744,7 +773,10 @@ func (rf *Raft) leaderMain() {
 	}
 	rf.logMutex.RUnlock()
 	rf.peerLogMutex.Unlock()
+	rf.leaderInitMutex.Lock()
 	rf.leaderInitDone = true
+	rf.leaderInitMutex.Unlock()
+	rf.logReplicationLog("leader init done\n")
 	// 每 40 ms 发送一轮 heartbeat
 	for {
 		// send heartbeat to all servers
@@ -773,36 +805,29 @@ type WrappedRequestVoteReply struct {
 	reply RequestVoteReply
 }
 
-func (rf *Raft) sendRequestVoteToAll() {
+func (rf *Raft) sendRequestVoteToAll(thisTerm int) {
 	grantedVoteSum := 1
-	rf.raftState.rLock()
-	thisTerm := rf.raftState.currentTerm
-	rf.raftState.rUnlock()
 	replyChannel := make(chan WrappedRequestVoteReply, 10)
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		rf.raftState.rLock()
 		rf.logMutex.RLock()
-		args := RequestVoteArgs{rf.raftState.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-1].Term}
+		args := RequestVoteArgs{thisTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-1].Term}
 		rf.logMutex.RUnlock()
-		rf.raftState.rUnlock()
 		var reply RequestVoteReply
 		go rf.sendRequestVoteWithChannelReply(i, &args, &reply, replyChannel)
 	}
 	// process reply
 	for {
-		rf.raftState.rLock()
+		reply := <-replyChannel
+		rf.raftState.wLock()
 		if rf.raftState.currentTerm > thisTerm || rf.raftState.state != candidateState {
-			rf.raftState.rUnlock()
+			rf.raftState.wUnlock()
 			break
 		}
-		rf.raftState.rUnlock()
-		reply := <-replyChannel
 		if reply.ok {
 			rf.electionLog("get reply from server %d\n", reply.from)
-			rf.raftState.wLock()
 			if reply.reply.Term > rf.raftState.currentTerm {
 				rf.electionLog("turn into follower for term update\n")
 				rf.raftState.currentTerm = reply.reply.Term
@@ -816,15 +841,17 @@ func (rf *Raft) sendRequestVoteToAll() {
 				if grantedVoteSum > len(rf.peers)/2 && rf.raftState.isState(candidateState) {
 					rf.electionLog("become leader\n")
 					rf.raftState.state = leaderState
+					rf.leaderInitMutex.Lock()
 					rf.leaderInitDone = false
+					rf.leaderInitMutex.Unlock()
 				}
 			}
-			rf.raftState.wUnlock()
 		} else {
 			// retry
 			var retryReply RequestVoteReply
 			go rf.sendRequestVoteWithChannelReply(reply.from, &reply.args, &retryReply, replyChannel)
 		}
+		rf.raftState.wUnlock()
 	}
 }
 
@@ -842,9 +869,9 @@ func (rf *Raft) doElection() {
 	rf.logMutex.RLock()
 	rf.persist()
 	rf.logMutex.RUnlock()
-	rf.raftState.wUnlock()
 	// send out request vote rpc
-	go rf.sendRequestVoteToAll()
+	go rf.sendRequestVoteToAll(rf.raftState.currentTerm)
+	rf.raftState.wUnlock()
 	var electionMaxTime int
 	electionMaxTime = 15 + rand.Intn(15)
 	for i := 0; i < electionMaxTime; i++ {
@@ -955,8 +982,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.electionDebug = false
-	rf.logReplicationDebug = true
-	rf.persistenceDebug = true
+	rf.logReplicationDebug = false
+	rf.persistenceDebug = false
 	rf.raftState = MakeRaftState(rf)
 	// log[0] is unused, just to start at 1.
 	rf.log = make([]LogEntry, 1)

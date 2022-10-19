@@ -414,11 +414,29 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
    rf.raftState.rLock()
    isLeader = rf.raftState.isState(leaderState)
    if isLeader {
-      rf.logReplicationLog("waiting for leader init...\n")
-      for !rf.leaderInitDone {
-         time.Sleep(time.Millisecond)
-      }
-      rf.logReplicationLog("append %v into local\n", command)
+      for {
+			rf.leaderInitMutex.Lock()
+			if rf.leaderInitDone {
+				rf.leaderInitMutex.Unlock()
+				break
+			}
+			rf.leaderInitMutex.Unlock()
+			rf.logReplicationLog("waiting for leader init...\n")
+			// 注意！这里有可能刚成为 leader ，甚至没去过 leaderMain，Start就来了，导致根本没机会init
+			// 睡眠等待时释放锁，防死锁
+			rf.raftState.rUnlock()
+			time.Sleep(time.Millisecond * time.Duration(2))
+			rf.raftState.rLock()
+			if !rf.raftState.isState(leaderState) {
+				rf.logReplicationLog("while waiting for leader init in Start, server role has changed\n")
+				isLeader = false
+				term = rf.raftState.currentTerm
+				rf.logMutex.RLock()
+				index = len(rf.log) - 1
+				rf.logMutex.RUnlock()
+				return index, term, isLeader
+			}
+		}
       ....
    } else {
       rf.logMutex.RLock()
@@ -430,6 +448,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
    return index, term, isLeader
 }
 ```
+
+中途出现过 leaderInitDone 一直是 false，sleep 根本停不下来。经过漫长的排查，发现是在 election 中成为 leader 后，直接被安排了 Start，压根还没进 leaderMain 进行 Init，所以我们需要在 Start 的等待过程中把锁释放，让 leader 有机会进行 init。而且又要注意，因为释放了锁，所以等待过程中 leader 的 state 也有可能被改变，需要在重新锁上时进行判断。
 
 #### guarantee AppendEntriesArgs Term precise
 
@@ -559,3 +579,123 @@ Raft 采用投票的方式来保证一个 candidate 只有拥有之前所有任�
 ### Results
 
 ![image-20221011082737886](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/image-20221011082737886.png)
+
+## Part 2C - Persistence
+
+这个 part 其实自己的代码非常简单，但是测试用例非常的强，导致会发现不少前面的 part 的问题。
+
+### Main Idea
+
+#### Serialization
+
+```go
+// 内部不锁，外部来锁
+func (rf *Raft) persist() {
+   // Your code here (2C).
+   rf.persistenceLog("persist states and logs\n")
+   w := new(bytes.Buffer)
+   e := labgob.NewEncoder(w)
+   // e.Encode(rf.xxx)
+   // e.Encode(rf.yyy)
+   e.Encode(rf.raftState.currentTerm)
+   e.Encode(rf.raftState.votedFor)
+   e.Encode(len(rf.log))
+   for _, entry := range rf.log {
+      e.Encode(entry)
+   }
+   //e.Encode(rf.log)
+   data := w.Bytes()
+   rf.persister.SaveRaftState(data)
+}
+```
+
+注意这里加装了一个 len(rf.log)，为后续反序列化提供便利。
+
+#### Deserialization
+
+```go
+//
+// restore previously persisted state.
+//
+func (rf *Raft) readPersist(data []byte) {
+   if data == nil || len(data) < 1 { // bootstrap without any state?
+      return
+   }
+   // Your code here (2C).
+   // Example:
+   r := bytes.NewBuffer(data)
+   d := labgob.NewDecoder(r)
+   var currentTerm int
+   var votedFor int
+   var logLength int
+   var logEntries []LogEntry
+   if d.Decode(&currentTerm) != nil ||
+      d.Decode(&votedFor) != nil ||
+      d.Decode(&logLength) != nil {
+      log.Fatalln("failed deserialization of term or votedFor or logLength.")
+   } else {
+      rf.persistenceLog("log length: %d\n", logLength)
+      // decode log
+      logEntries = make([]LogEntry, logLength)
+      for i := 0; i < logLength; i++ {
+         if d.Decode(&logEntries[i]) != nil {
+            log.Fatalln("failed deserialization of log.")
+         }
+      }
+      rf.raftState.currentTerm = currentTerm
+      rf.raftState.votedFor = votedFor
+      rf.log = logEntries
+   }
+}
+```
+
+#### When to persist
+
+![image-20221019231606637](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/image-20221019231606637.png)
+
+我做得非常简单：每次这些量改了就 persist。
+
+![image-20221019231637690](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/image-20221019231637690.png)
+
+### Figure8Unreliable2C
+
+著名的一个难过的点，具体就是前期因为网络被设置为 unreliable 并且经常搞点 connect disconnect 的小动作，导致会有一大堆 Log 冲突（几百条），后期一个个地 retry 根本来不及，很快就超时了。
+
+然后发现这一点已经给了 hint：
+
+![image-20221019232257377](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/image-20221019232257377.png)
+
+文章的提示是这样的，可以在发现不同时，一次性直接退到本地的冲突 log 所在 term 的第一条 log （因为这个 term 内的 log 可能都是自己自嗨生成的）。
+
+于是这样修改，在 AppendEntriesReply 中增加一项下次 retry 的 nextIndex，来加快重试的速度。
+
+```go
+if args.PrevLogIndex > len(rf.log)-1 || (args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+   rf.logReplicationLog("server %d 's prev log not match, return false\n", args.LeaderId)
+   reply.Success = false
+   if args.PrevLogIndex > len(rf.log)-1 {
+      reply.NextRetryStartIndex = len(rf.log)
+   } else {
+      conflictTerm := rf.log[args.PrevLogIndex].Term
+      tempIndex := args.PrevLogIndex
+      if tempIndex == 0 {
+         log.Fatalf("ERROR: log[0]'s term conflict???\n")
+      }
+      for tempIndex > 1 && rf.log[tempIndex].Term == conflictTerm {
+         tempIndex -= 1
+      }
+      reply.NextRetryStartIndex = tempIndex
+   }
+   rf.logMutex.Unlock()
+   rf.raftState.wUnlock()
+   return
+}
+```
+
+于是顺利通过。
+
+另外需要注意的是，只在 log inconsistent 的时候进行重试，而不会在 leader 的 term 过老时重试。这一点需要 leader 接收 reply 时判断清楚。
+
+### Results
+
+![image-20221019233553268](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/image-20221019233553268.png)

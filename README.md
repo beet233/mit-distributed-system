@@ -8,7 +8,7 @@ Based on [mit-6.824]([6.824 Schedule: Spring 2022 (mit.edu)](https://pdos.csail.
 
   - [x] Part 2A - leader election
   - [x] Part 2B - log
-  - [ ] Part 2C - persistence
+  - [x] Part 2C - persistence
   - [ ] Part 2D - log compaction
 
 - [ ] Lab 3 - KV Raft

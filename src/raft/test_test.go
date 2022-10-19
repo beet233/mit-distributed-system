@@ -839,6 +839,7 @@ func TestPersist32C(t *testing.T) {
 // The leader in a new Term may try to finish replicating log Entries that
 // haven't been committed yet.
 //
+// TODO: 这个的报错那次非常神秘，完全不应该有死锁，但是就是没释放掉，怀疑是 leaderInitDone 之类的变量没上锁导致的偶发 race 之类的
 func TestFigure82C(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false, false)
@@ -955,6 +956,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		}
 
 		if leader != -1 && (rand.Int()%1000) < int(RaftElectionTimeout/time.Millisecond)/2 {
+			DPrintf("disconnect server %d", leader)
 			cfg.disconnect(leader)
 			nup -= 1
 		}
@@ -962,6 +964,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		if nup < 3 {
 			s := rand.Int() % servers
 			if cfg.connected[s] == false {
+				DPrintf("connect server %d", s)
 				cfg.connect(s)
 				nup += 1
 			}
@@ -973,8 +976,12 @@ func TestFigure8Unreliable2C(t *testing.T) {
 			cfg.connect(i)
 		}
 	}
-
-	cfg.one(rand.Int()%10000, servers, true)
+	randCommand := rand.Int() % 10000
+	cfg.t.Logf("final randCommand: %v", randCommand)
+	for i := 0; i < servers; i++ {
+		cfg.t.Logf("server %v 's log: %v", i, cfg.rafts[i].log)
+	}
+	cfg.one(randCommand, servers, true)
 
 	cfg.end()
 }
