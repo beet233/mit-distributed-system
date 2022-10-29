@@ -699,3 +699,15 @@ if args.PrevLogIndex > len(rf.log)-1 || (args.PrevLogIndex >= 0 && rf.log[args.P
 ### Results
 
 ![image-20221019233553268](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/image-20221019233553268.png)
+
+## Part 2D - Log Compaction
+
+### Hint
+
+#### What the Copy on Write when creating snapshots means?
+
+当创建一个 Snapshot 并序列化的时候，我们可能需要很长的时间，如果这期间就这么阻塞了，会带来比较大的影响。
+
+Copy on Write 指借用 Linux 的 fork，直接先上锁暂停，fork 一个一模一样的子进程（还没有自己的空间，指针指向父进程的空间），当父进程/子进程中的任何一方想要发生变更时，子进程对父进程的空间进行一次完全一样的拷贝，变成自己的私有空间，然后进行创建 Snapshot 的操作。这样一来，创建 Snapshot 的暂停时间从完完全全创建和序列化 Snapshot，变成了一次进程拷贝的时间，大大减少了时延。
+
+参考了：[深入Raft中的日志压缩 - 知乎 (zhihu.com)](https://zhuanlan.zhihu.com/p/334610146)
