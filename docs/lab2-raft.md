@@ -702,6 +702,8 @@ if args.PrevLogIndex > len(rf.log)-1 || (args.PrevLogIndex >= 0 && rf.log[args.P
 
 ## Part 2D - Log Compaction
 
+理清思路和难点参考了：[MIT6.824-lab2D-2022（日志压缩详细讲解）_幸平xp的博客-CSDN博客](https://blog.csdn.net/weixin_45938441/article/details/125179308)
+
 ### Hint
 
 #### What the Copy on Write when creating snapshots means?
@@ -710,4 +712,37 @@ if args.PrevLogIndex > len(rf.log)-1 || (args.PrevLogIndex >= 0 && rf.log[args.P
 
 Copy on Write 指借用 Linux 的 fork，直接先上锁暂停，fork 一个一模一样的子进程（还没有自己的空间，指针指向父进程的空间），当父进程/子进程中的任何一方想要发生变更时，子进程对父进程的空间进行一次完全一样的拷贝，变成自己的私有空间，然后进行创建 Snapshot 的操作。这样一来，创建 Snapshot 的暂停时间从完完全全创建和序列化 Snapshot，变成了一次进程拷贝的时间，大大减少了时延。
 
+我感觉，简单做就是：首先锁住，整个 log 拷贝；然后解锁，在一个新线程中做创建 Snapshot 这件事即可。
+
 参考了：[深入Raft中的日志压缩 - 知乎 (zhihu.com)](https://zhuanlan.zhihu.com/p/334610146)
+
+#### How functions of 2D would be used?
+
++ ```go
+  func (rf *Raft) Snapshot(index int, snapshot []byte)
+  ```
+
+  由 Service 层来调用 rf.Snapshot，index 为快照包含的最新 Log index，snapshot 为快照的字节流。那么 Service 层从哪搞来快照呢？
+
++ ```go
+  func (ps *Persister) ReadSnapshot() []byte
+  ```
+
+  在 `persister.go` 中，有 ReadSnapshot 函数。客户端从此来读取各个 server 的快照。
+
++ ```go
+  func (ps *Persister) SaveStateAndSnapshot(state []byte, snapshot []byte)
+  ```
+
+  raft server 自己将 raft 的 state 和 snapshot 处理成字节流后存进持久化存储。
+
++ ![img](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/202210302311300.png)
+
+  当某个 follower 过于落后时，Leader 调用 follower 的这个 RPC，让它用快照迅速更新。
+
++ ```go
+  func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool
+  ```
+
+  因为 applyCh 现在既要处理正常的日志追加，又要让快照也走这个 ch，所以有可能发生混乱（具体还没想清楚），但是据说只要管理好同步问题，这个函数现在是没有必要的，可以保持返回 true 就行。
+
