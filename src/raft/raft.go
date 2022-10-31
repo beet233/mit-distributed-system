@@ -77,8 +77,10 @@ type Raft struct {
 	// state a Raft server must maintain.
 	raftState *RaftState
 
-	log      []LogEntry
-	logMutex deadlock.RWMutex
+	log               []LogEntry
+	lastIncludedIndex int
+	lastIncludedTerm  int
+	logMutex          deadlock.RWMutex
 
 	commitIndex int
 	commitMutex deadlock.RWMutex
@@ -102,6 +104,7 @@ type Raft struct {
 	electionDebug       bool
 	logReplicationDebug bool
 	persistenceDebug    bool
+	snapshotDebug       bool
 }
 
 // return currentTerm and whether this server
@@ -153,6 +156,12 @@ func (rf *Raft) logReplicationLog(format string, vars ...interface{}) {
 
 func (rf *Raft) persistenceLog(format string, vars ...interface{}) {
 	if rf.persistenceDebug {
+		rf.logWithRaftStatus(format, vars...)
+	}
+}
+
+func (rf *Raft) snapshotLog(format string, vars ...interface{}) {
+	if rf.snapshotDebug {
 		rf.logWithRaftStatus(format, vars...)
 	}
 }
@@ -232,7 +241,36 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	if rf.killed() {
+		return
+	}
+	// TODO: 问题，到底什么时候会调用这个？是崩溃后复活的时候吗？
+	// TODO: 在调用这个的时候，我的 commitIndex 和 lastApplied 都是什么情况？
+	// TODO: 将 log 砍到从 index + 1 开始的剩下部分，并将快照保存进 persister
+	// 这里用 defer 可以避免每个退出的地方都要解锁的问题
+	rf.raftState.rLock()
+	defer rf.raftState.rUnlock()
+	rf.logMutex.Lock()
+	defer rf.logMutex.Unlock()
+	if rf.lastIncludedIndex >= index {
+		rf.snapshotLog("log until index %d has been snapshot before\n", index)
+		return
+	}
+	if rf.commitIndex < index {
+		rf.snapshotLog("log until index %d has not been committed!\n", index)
+		return
+	}
+	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = rf.log[index].Term
+	leftLog := make([]LogEntry, 0)
+	startIndex := index + 1
+	for startIndex < len(rf.log) {
+		leftLog = append(leftLog, rf.log[startIndex])
+	}
+	rf.persist()
+	var data []byte
+	rf.readPersist(data)
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
 }
 
 //
@@ -984,6 +1022,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionDebug = false
 	rf.logReplicationDebug = false
 	rf.persistenceDebug = false
+	rf.snapshotDebug = false
 	rf.raftState = MakeRaftState(rf)
 	// log[0] is unused, just to start at 1.
 	rf.log = make([]LogEntry, 1)
@@ -991,6 +1030,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Term:    0,
 		Command: nil,
 	}
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
