@@ -722,19 +722,19 @@ Copy on Write 指借用 Linux 的 fork，直接先上锁暂停，fork 一个一�
   func (rf *Raft) Snapshot(index int, snapshot []byte)
   ```
 
-  由 Service 层来调用 rf.Snapshot，index 为快照包含的最新 Log index，snapshot 为快照的字节流。那么 Service 层从哪搞来快照呢？
+  由 Service 层来调用 rf.Snapshot，让该 server 用快照来替换前面的日志。index 为快照包含的最新 Log index，snapshot 为快照的字节流。那么 Service 层从哪搞来快照呢？答案就是在 Service 层自己实现，不用 raft 这边管。
 
 + ```go
   func (ps *Persister) ReadSnapshot() []byte
   ```
 
-  在 `persister.go` 中，有 ReadSnapshot 函数。客户端从此来读取各个 server 的快照。
+  在 `persister.go` 中，有 ReadSnapshot 函数。Service 层以此来在崩坏重启后，读取快照。
 
 + ```go
   func (ps *Persister) SaveStateAndSnapshot(state []byte, snapshot []byte)
   ```
 
-  raft server 自己将 raft 的 state 和 snapshot 处理成字节流后存进持久化存储。
+  raft server 自己将 raft 的 state 处理成字节流后和 snapshot 一起存进持久化存储。
 
 + ![img](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/202210302311300.png)
 
