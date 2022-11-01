@@ -746,14 +746,20 @@ Copy on Write 指借用 Linux 的 fork，直接先上锁暂停，fork 一个一�
 
   当某个 follower 过于落后时，Leader 调用 follower 的这个 RPC，让它用快照迅速更新。
 
+  注意，论文中这里的 Snapshot 的 data 使用了 offset 和分块传输的方法，但是本实验为了简单起见，这是不要求实现的，只需要一整个 snapshot 进行传输即可。
+
 + ```go
   func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool
   ```
 
   因为 applyCh 现在既要处理正常的日志追加，又要让快照也走这个 ch，所以有可能发生混乱（具体还没想清楚），但是据说只要管理好同步问题，这个函数现在是没有必要的，可以保持返回 true 就行。
 
+#### Save lastIncludedIndex and lastIncludedTerm
+
+快照中包含的最后一项 log 的信息应当被保存为 raft 的 state，并且也由 persister 进行持久化。
+
 ## Backup
 
 ### Lock Order
 
-`rf.raftState` -> `rf.peerLogMutex` -> `rf.logMutex` -> `rf.commitMutex`
+`rf.raftState` -> `rf.peerLogMutex` -> `rf.logMutex` -> `rf.commitMutex` -> `rf.leaderInitMutex`

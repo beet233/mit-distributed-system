@@ -112,13 +112,13 @@ type Raft struct {
 func (rf *Raft) GetState() (int, bool) {
 
 	var term int
-	var isleader bool
+	var isLeader bool
 	// Your code here (2A).
 	rf.raftState.rLock()
 	term = rf.raftState.currentTerm
-	isleader = rf.raftState.isState(leaderState)
+	isLeader = rf.raftState.isState(leaderState)
 	rf.raftState.rUnlock()
-	return term, isleader
+	return term, isLeader
 }
 
 func (rf *Raft) logWithRaftStatus(format string, vars ...interface{}) {
@@ -232,10 +232,10 @@ func (rf *Raft) getLogLength() int {
 
 func (rf *Raft) getTermOfLog(index int) int {
 	if index >= rf.getLogLength() {
-		log.Fatalf("server %d does not have log %d yet\n", rf.me, index)
+		log.Fatalf("getTermOfLog: server %d does not have log %d yet\n", rf.me, index)
 	}
 	if index < rf.lastIncludedIndex {
-		log.Fatalf("server %d has save log %d to snapshot\n", rf.me, index)
+		log.Fatalf("getTermOfLog: server %d has save log %d to snapshot\n", rf.me, index)
 	} else if index == rf.lastIncludedIndex {
 		return rf.lastIncludedTerm
 	} else {
@@ -246,10 +246,10 @@ func (rf *Raft) getTermOfLog(index int) int {
 
 func (rf *Raft) getLog(index int) LogEntry {
 	if index >= rf.getLogLength() {
-		log.Fatalf("server %d does not have log %d yet\n", rf.me, index)
+		log.Fatalf("getLog: server %d does not have log %d yet\n", rf.me, index)
 	}
 	if index <= rf.lastIncludedIndex {
-		log.Fatalf("server %d has save log %d to snapshot\n", rf.me, index)
+		log.Fatalf("getLog: server %d has save log %d to snapshot\n", rf.me, index)
 	} else {
 		return rf.log[index-rf.lastIncludedIndex-1]
 	}
@@ -259,10 +259,10 @@ func (rf *Raft) getLog(index int) LogEntry {
 // start 和 end 为真正的 index，即加上快照的 lastIncludedIndex 后的
 func (rf *Raft) getLogs(start int, end int) []LogEntry {
 	if end > rf.getLogLength() {
-		log.Fatalf("server %d getLogs end %d overflow\n", rf.me, end)
+		log.Fatalf("getLogs: server %d getLogs end %d overflow\n", rf.me, end)
 	}
 	if start <= rf.lastIncludedIndex {
-		log.Fatalf("server %d has save log %d to snapshot\n", rf.me, start)
+		log.Fatalf("getLogs: server %d has save log %d to snapshot\n", rf.me, start)
 	}
 	if rf.lastIncludedIndex >= 0 {
 		return rf.log[start-rf.lastIncludedIndex-1 : end-rf.lastIncludedIndex-1]
@@ -302,6 +302,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.raftState.rUnlock()
 	rf.logMutex.Lock()
 	defer rf.logMutex.Unlock()
+	rf.commitMutex.RLock()
+	defer rf.commitMutex.RUnlock()
 	if rf.lastIncludedIndex >= index {
 		rf.snapshotLog("log until index %d has been snapshot before\n", index)
 		return
@@ -333,9 +335,9 @@ type InstallSnapshotArgs struct {
 	LeaderId          int
 	LastIncludedIndex int
 	LastIncludedTerm  int
-	Offset            int
 	Data              []byte
-	Done              bool
+	//Offset            int
+	//Done              bool
 }
 
 type InstallSnapshotReply struct {
@@ -724,6 +726,7 @@ func (rf *Raft) sendHeartbeatToAll(thisTerm int) {
 	}
 }
 
+// TODO: 经常有 potential deadlock 和这里有关, 但这里的上锁顺序似乎没什么大毛病
 func (rf *Raft) tryIncrementCommitIndex() {
 	rf.raftState.rLock()
 	rf.logMutex.RLock()
