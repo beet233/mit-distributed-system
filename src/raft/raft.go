@@ -328,6 +328,24 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.persister.SaveStateAndSnapshot(data, snapshot)
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Offset            int
+	Data              []byte
+	Done              bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+
+}
+
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -793,7 +811,6 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 				rf.persist()
 				rf.logMutex.RUnlock()
 			}
-			// TODO: check this part
 			if reply.reply.Success {
 				rf.logReplicationLog("server %d append success!\n", reply.from)
 				successCount += 1
@@ -817,9 +834,9 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 				if reply.reply.NextRetryStartIndex == 0 {
 					log.Fatalf("ERROR: NextRetryStartIndex is 0!!\n")
 				}
+				// TODO: 如果 reply.reply.NextRetryStartIndex 已经被包含进快照里，没有实际 log 了，那么把快照发给 follower
 				rf.nextIndex[reply.from] = reply.reply.NextRetryStartIndex
-				// TODO: 这里的重发并不使用最新的 term 和 leader commit，而是保持原请求的值，只更新prev、entries
-				// TODO: 另外，如果在此期间会有新的 log 进来，这样的情况还未被妥善考虑
+				// 这里的重发并不使用最新的 term 和 leader commit，而是保持原请求的值，只更新prev、entries
 				newArgs := reply.args
 				// 将 PrevLogIndex 直接和 nextIndex 绑定而不是简单递减，避免多个 append to all 并发时出现问题
 				newArgs.PrevLogIndex = rf.nextIndex[reply.from] - 1
