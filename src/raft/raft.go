@@ -224,6 +224,38 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
+// need to lock logMutex outside by caller
+func (rf *Raft) getLogLength() int {
+	// rf.lastIncludedIndex is init to -1, so if it has no snapshot, it returns len(rf.log)
+	return rf.lastIncludedIndex + len(rf.log) + 1
+}
+
+func (rf *Raft) getTermOfLog(index int) int {
+	if index >= rf.getLogLength() {
+		log.Fatalf("server %d does not have log %d yet\n", rf.me, index)
+	}
+	if index < rf.lastIncludedIndex {
+		log.Fatalf("server %d has save log %d to snapshot\n", rf.me, index)
+	} else if index == rf.lastIncludedIndex {
+		return rf.lastIncludedTerm
+	} else {
+		return rf.log[index-rf.lastIncludedIndex-1].Term
+	}
+	return -1
+}
+
+func (rf *Raft) getLog(index int) LogEntry {
+	if index >= rf.getLogLength() {
+		log.Fatalf("server %d does not have log %d yet\n", rf.me, index)
+	}
+	if index <= rf.lastIncludedIndex {
+		log.Fatalf("server %d has save log %d to snapshot\n", rf.me, index)
+	} else {
+		return rf.log[index-rf.lastIncludedIndex-1]
+	}
+	return LogEntry{}
+}
+
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
@@ -264,14 +296,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 	leftLog := make([]LogEntry, 0)
 	startIndex := index + 1
-	// TODO: rf.getLogLength()
-	// TODO: rf.getLog(index int)
-	for startIndex < len(rf.log) {
-		leftLog = append(leftLog, rf.log[startIndex])
+	for startIndex < rf.getLogLength() {
+		leftLog = append(leftLog, rf.getLog(startIndex))
 	}
 	rf.log = leftLog
-	//rf.lastIncludedIndex = index
-	//rf.lastIncludedTerm = rf.getLog(index).Term
+	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = rf.getTermOfLog(index)
 	rf.persist()
 	var data []byte
 	rf.readPersist(data)
@@ -1035,8 +1065,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Term:    0,
 		Command: nil,
 	}
-	rf.lastIncludedIndex = 0
-	rf.lastIncludedTerm = 0
+	rf.lastIncludedIndex = -1
+	rf.lastIncludedTerm = -1
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
