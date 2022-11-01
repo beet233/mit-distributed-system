@@ -256,6 +256,26 @@ func (rf *Raft) getLog(index int) LogEntry {
 	return LogEntry{}
 }
 
+// start 和 end 为真正的 index，即加上快照的 lastIncludedIndex 后的
+func (rf *Raft) getLogs(start int, end int) []LogEntry {
+	if end > rf.getLogLength() {
+		log.Fatalf("server %d getLogs end overflow\n", rf.me, end)
+	}
+	if start <= rf.lastIncludedIndex {
+		log.Fatalf("server %d has save log %d to snapshot\n", rf.me, start)
+	}
+	if rf.lastIncludedIndex >= 0 {
+		return rf.log[start-rf.lastIncludedIndex-1 : end-rf.lastIncludedIndex-1]
+	} else {
+		return rf.log[start:end]
+	}
+}
+
+// start 为真正的 index，即加上快照的 lastIncludedIndex 后的
+func (rf *Raft) getLogsFrom(start int) []LogEntry {
+	return rf.getLogs(start, rf.getLogLength())
+}
+
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
@@ -352,10 +372,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			// 怎么判断 candidate 是不是至少比 “我” 新？我有可能比它的 Log 少，而且我可能以前当过失败的 leader ，有着它没有的 Log，这个还挺有意思，可以在文档补充
 			isNewerThanMe := false
 			rf.logMutex.RLock()
-			if len(rf.log) == 1 || args.LastLogTerm > rf.log[len(rf.log)-1].Term {
+			if rf.getLogLength() == 1 || args.LastLogTerm > rf.getTermOfLog(rf.getLogLength()-1) {
 				isNewerThanMe = true
-			} else if args.LastLogTerm == rf.log[len(rf.log)-1].Term {
-				if args.LastLogIndex >= len(rf.log)-1 {
+			} else if args.LastLogTerm == rf.getTermOfLog(rf.getLogLength()-1) {
+				if args.LastLogIndex >= rf.getLogLength()-1 {
 					isNewerThanMe = true
 				}
 			}
@@ -423,18 +443,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.raftState.wUnlock()
 		return
 	}
-	if args.PrevLogIndex > len(rf.log)-1 || (args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+	// 只有 applied 才会被 snapshot，所以其实访问到被 snapshot 过的数据并不是那么常见的事
+	if args.PrevLogIndex > rf.getLogLength()-1 || (args.PrevLogIndex >= 0 && rf.getTermOfLog(args.PrevLogIndex) != args.PrevLogTerm) {
 		rf.logReplicationLog("server %d 's prev log not match, return false\n", args.LeaderId)
 		reply.Success = false
-		if args.PrevLogIndex > len(rf.log)-1 {
-			reply.NextRetryStartIndex = len(rf.log)
+		if args.PrevLogIndex > rf.getLogLength()-1 {
+			reply.NextRetryStartIndex = rf.getLogLength()
 		} else {
-			conflictTerm := rf.log[args.PrevLogIndex].Term
+			conflictTerm := rf.getTermOfLog(args.PrevLogIndex)
 			tempIndex := args.PrevLogIndex
 			if tempIndex == 0 {
 				log.Fatalf("ERROR: log[0]'s term conflict???\n")
 			}
-			for tempIndex > 1 && rf.log[tempIndex].Term == conflictTerm {
+			for tempIndex > 1 && rf.getTermOfLog(tempIndex) == conflictTerm {
 				tempIndex -= 1
 			}
 			reply.NextRetryStartIndex = tempIndex
@@ -449,9 +470,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logReplicationLog("log copying...\n")
 		rf.logReplicationLog("original log: %v\n", rf.log)
 		for i := 0; i < len(args.Entries); i++ {
-			if args.PrevLogIndex+1+i > len(rf.log)-1 {
+			if args.PrevLogIndex+1+i > rf.getLogLength()-1 {
 				rf.log = append(rf.log, args.Entries[i])
-			} else if rf.log[args.PrevLogIndex+1+i].Term != args.Entries[i].Term {
+			} else if rf.getTermOfLog(args.PrevLogIndex+1+i) != args.Entries[i].Term {
 				rf.log = rf.log[0 : args.PrevLogIndex+1+i]
 				rf.log = append(rf.log, args.Entries[i])
 			}
@@ -466,10 +487,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.commitMutex.Lock()
 	if args.LeaderCommit > rf.commitIndex {
-		if args.LeaderCommit < len(rf.log)-1 {
+		if args.LeaderCommit < rf.getLogLength()-1 {
 			rf.commitIndex = args.LeaderCommit
 		} else {
-			rf.commitIndex = len(rf.log) - 1
+			rf.commitIndex = rf.getLogLength() - 1
 		}
 		rf.logReplicationLog("input 0 into applyNotifyCh\n")
 		rf.applyNotifyCh <- 0
@@ -556,7 +577,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				isLeader = false
 				term = rf.raftState.currentTerm
 				rf.logMutex.RLock()
-				index = len(rf.log) - 1
+				index = rf.getLogLength() - 1
 				rf.logMutex.RUnlock()
 				return index, term, isLeader
 			}
@@ -568,9 +589,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.log = append(rf.log, LogEntry{rf.raftState.currentTerm, command})
 		rf.logReplicationLog("appended log: %v\n", rf.log)
 		rf.persist()
-		rf.matchIndex[rf.me] = len(rf.log) - 1
-		rf.nextIndex[rf.me] = len(rf.log)
-		index = len(rf.log) - 1
+		rf.matchIndex[rf.me] = rf.getLogLength() - 1
+		rf.nextIndex[rf.me] = rf.getLogLength()
+		index = rf.getLogLength() - 1
 		rf.logMutex.Unlock()
 		rf.peerLogMutex.Unlock()
 		// broadcast this log
@@ -580,7 +601,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		go rf.sendAppendEntriesToAll(rf.raftState.currentTerm)
 	} else {
 		rf.logMutex.RLock()
-		index = len(rf.log) - 1
+		index = rf.getLogLength() - 1
 		rf.logMutex.RUnlock()
 	}
 	term = rf.raftState.currentTerm
@@ -645,8 +666,8 @@ func (rf *Raft) sendHeartbeatToAll(thisTerm int) {
 		if i == rf.me {
 			continue
 		}
-		prevLogIndex := len(rf.log) - 1
-		prevLogTerm := rf.log[prevLogIndex].Term
+		prevLogIndex := rf.getLogLength() - 1
+		prevLogTerm := rf.getTermOfLog(prevLogIndex)
 		rf.commitMutex.RLock()
 		args := AppendEntriesArgs{thisTerm, rf.me, nil, prevLogIndex, prevLogTerm, rf.commitIndex}
 		rf.commitMutex.RUnlock()
@@ -689,7 +710,7 @@ func (rf *Raft) tryIncrementCommitIndex() {
 	rf.raftState.rLock()
 	rf.logMutex.RLock()
 	rf.commitMutex.RLock()
-	thisLogLength := len(rf.log)
+	thisLogLength := rf.getLogLength()
 	thisTerm := rf.raftState.currentTerm
 	thisCommitIndex := rf.commitIndex
 	rf.commitMutex.RUnlock()
@@ -697,7 +718,7 @@ func (rf *Raft) tryIncrementCommitIndex() {
 	rf.raftState.rUnlock()
 	for i := thisCommitIndex + 1; i < thisLogLength; i++ {
 		rf.logMutex.RLock()
-		nowLogTerm := rf.log[i].Term
+		nowLogTerm := rf.getTermOfLog(i)
 		rf.logMutex.RUnlock()
 		if nowLogTerm == thisTerm {
 			count := 0
@@ -728,15 +749,15 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 			continue
 		}
 		rf.logReplicationLog("nextIndex[%d] = %d\n", i, rf.nextIndex[i])
-		if len(rf.log)-1 >= rf.nextIndex[i] {
+		if rf.getLogLength()-1 >= rf.nextIndex[i] {
 			// 这里的prevLogIndex 定义是 “index of log entry immediately preceding
 			// new ones”，但我实际发送的是从 nextIndex 开始的 Entries，对那个 server 来说从这里开始都是 new ones，
 			// 所以也应该让 prevLogIndex 为 nextIndex -1
 			// prevLogIndex := len(rf.log) - 2
 			prevLogIndex := rf.nextIndex[i] - 1
-			prevLogTerm := rf.log[prevLogIndex].Term
+			prevLogTerm := rf.getTermOfLog(prevLogIndex)
 			rf.commitMutex.RLock()
-			args := AppendEntriesArgs{thisTerm, rf.me, rf.log[rf.nextIndex[i]:], prevLogIndex, prevLogTerm, rf.commitIndex}
+			args := AppendEntriesArgs{thisTerm, rf.me, rf.getLogsFrom(rf.nextIndex[i]), prevLogIndex, prevLogTerm, rf.commitIndex}
 			rf.commitMutex.RUnlock()
 			var reply AppendEntriesReply
 			go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
@@ -804,9 +825,9 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 				newArgs.PrevLogIndex = rf.nextIndex[reply.from] - 1
 				rf.logMutex.RLock()
 				if newArgs.PrevLogIndex >= 0 {
-					newArgs.PrevLogTerm = rf.log[newArgs.PrevLogIndex].Term
+					newArgs.PrevLogTerm = rf.getTermOfLog(newArgs.PrevLogIndex)
 				}
-				newArgs.Entries = rf.log[rf.nextIndex[reply.from]:]
+				newArgs.Entries = rf.getLogsFrom(rf.nextIndex[reply.from])
 				rf.logReplicationLog("newArgs | to: %v, prevLogIndex: %v, entries: %v\n", reply.from, newArgs.PrevLogIndex, newArgs.Entries)
 				rf.logMutex.RUnlock()
 				rf.peerLogMutex.Unlock()
@@ -839,7 +860,7 @@ func (rf *Raft) leaderMain() {
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.logMutex.RLock()
 	for i, _ := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.log)
+		rf.nextIndex[i] = rf.getLogLength()
 	}
 	for i, _ := range rf.matchIndex {
 		rf.matchIndex[i] = 0
@@ -886,7 +907,7 @@ func (rf *Raft) sendRequestVoteToAll(thisTerm int) {
 			continue
 		}
 		rf.logMutex.RLock()
-		args := RequestVoteArgs{thisTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-1].Term}
+		args := RequestVoteArgs{thisTerm, rf.me, len(rf.log) - 1, rf.getTermOfLog(rf.getLogLength() - 1)}
 		rf.logMutex.RUnlock()
 		var reply RequestVoteReply
 		go rf.sendRequestVoteWithChannelReply(i, &args, &reply, replyChannel)
@@ -1008,7 +1029,7 @@ func (rf *Raft) applyLoop() {
 		rf.logReplicationLog("applyNotifyCh recv notification\n")
 		if rf.commitIndex > rf.lastApplied {
 			nextApplied := rf.lastApplied + 1
-			toBeApplied := rf.log[nextApplied : rf.commitIndex+1]
+			toBeApplied := rf.getLogs(nextApplied, rf.commitIndex+1)
 			rf.logReplicationLog("to be applied (from index %v): %v\n", nextApplied, toBeApplied)
 			// send to channel
 			// 注意！！！这里有可能会乱 go，导致顺序错误
