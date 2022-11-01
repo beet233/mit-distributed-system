@@ -259,7 +259,7 @@ func (rf *Raft) getLog(index int) LogEntry {
 // start 和 end 为真正的 index，即加上快照的 lastIncludedIndex 后的
 func (rf *Raft) getLogs(start int, end int) []LogEntry {
 	if end > rf.getLogLength() {
-		log.Fatalf("server %d getLogs end overflow\n", rf.me, end)
+		log.Fatalf("server %d getLogs end %d overflow\n", rf.me, end)
 	}
 	if start <= rf.lastIncludedIndex {
 		log.Fatalf("server %d has save log %d to snapshot\n", rf.me, start)
