@@ -244,9 +244,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if rf.killed() {
 		return
 	}
-	// TODO: 问题，到底什么时候会调用这个？是崩溃后复活的时候吗？
-	// TODO: 在调用这个的时候，我的 commitIndex 和 lastApplied 都是什么情况？
-	// TODO: 将 log 砍到从 index + 1 开始的剩下部分，并将快照保存进 persister
+	// 将 log 砍到从 index + 1 开始的剩下部分，并将快照保存进 persister
 	// 这里用 defer 可以避免每个退出的地方都要解锁的问题
 	rf.raftState.rLock()
 	defer rf.raftState.rUnlock()
@@ -260,13 +258,20 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.snapshotLog("log until index %d has not been committed!\n", index)
 		return
 	}
-	rf.lastIncludedIndex = index
-	rf.lastIncludedTerm = rf.log[index].Term
+	if rf.lastApplied < index {
+		rf.snapshotLog("log until index %d has not been applied!\n", index)
+		return
+	}
 	leftLog := make([]LogEntry, 0)
 	startIndex := index + 1
+	// TODO: rf.getLogLength()
+	// TODO: rf.getLog(index int)
 	for startIndex < len(rf.log) {
 		leftLog = append(leftLog, rf.log[startIndex])
 	}
+	rf.log = leftLog
+	//rf.lastIncludedIndex = index
+	//rf.lastIncludedTerm = rf.getLog(index).Term
 	rf.persist()
 	var data []byte
 	rf.readPersist(data)

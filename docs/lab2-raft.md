@@ -726,7 +726,9 @@ Copy on Write 指借用 Linux 的 fork，直接先上锁暂停，fork 一个一�
 
   ![img](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/202210312152598.jpeg)
   
-  注意一下，snapshot 里是包含最后一条 Log 的 index 和 term 的哟。Service 可能就是从这拿到的 index 吧，虽然好像有点重复？
+  注意一下，snapshot 里是包含最后一条 Log 的 index 和 term 的哟。Service 可能就是从这拿到的 index 吧，虽然好像有点重复，但毕竟只有 Service 那边负责对 snapshot 的序列化/反序列化嘛，raft 这边解析不来。
+  
+  另外，Snapshot 只用于 ***server 上传一些 log 后，被通知一部分 log 已经生成快照，Service 指示 server 进行日志压缩***。从 crash 状态的恢复并不走这个函数。
   
 + ```go
   func (ps *Persister) ReadSnapshot() []byte
