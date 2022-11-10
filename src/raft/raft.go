@@ -320,6 +320,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	startIndex := index + 1
 	for startIndex < rf.getLogLength() {
 		leftLog = append(leftLog, rf.getLog(startIndex))
+		startIndex += 1
 	}
 	rf.log = leftLog
 	rf.lastIncludedIndex = index
