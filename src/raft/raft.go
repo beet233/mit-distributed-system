@@ -1096,10 +1096,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.electionDebug = false
-	rf.logReplicationDebug = false
-	rf.persistenceDebug = false
-	rf.snapshotDebug = false
+	rf.electionDebug = true
+	rf.logReplicationDebug = true
+	rf.persistenceDebug = true
+	rf.snapshotDebug = true
 	rf.raftState = MakeRaftState(rf)
 	// log[0] is unused, just to start at 1.
 	rf.log = make([]LogEntry, 1)
