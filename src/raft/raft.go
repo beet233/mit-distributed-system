@@ -600,6 +600,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				rf.logMutex.RLock()
 				index = rf.getLogLength() - 1
 				rf.logMutex.RUnlock()
+				rf.raftState.rUnlock()
 				return index, term, isLeader
 			}
 		}
