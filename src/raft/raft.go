@@ -181,6 +181,8 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	e.Encode(rf.raftState.currentTerm)
 	e.Encode(rf.raftState.votedFor)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	e.Encode(len(rf.log))
 	for _, entry := range rf.log {
 		e.Encode(entry)
@@ -203,12 +205,16 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 	var logLength int
 	var logEntries []LogEntry
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil ||
 		d.Decode(&logLength) != nil {
-		log.Fatalln("failed deserialization of term or votedFor or logLength.")
+		log.Fatalln("failed deserialization of term or votedFor or lastIncludedIndex or lastIncludedTerm or logLength.")
 	} else {
 		rf.persistenceLog("log length: %d\n", logLength)
 		// decode log
@@ -220,6 +226,8 @@ func (rf *Raft) readPersist(data []byte) {
 		}
 		rf.raftState.currentTerm = currentTerm
 		rf.raftState.votedFor = votedFor
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 		rf.log = logEntries
 	}
 }
@@ -293,6 +301,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.snapshotLog("start snapshot\n")
 	if rf.killed() {
 		return
 	}
@@ -329,6 +338,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	var data []byte
 	rf.readPersist(data)
 	rf.persister.SaveStateAndSnapshot(data, snapshot)
+	rf.snapshotLog("finish snapshot\n")
 }
 
 type InstallSnapshotArgs struct {
