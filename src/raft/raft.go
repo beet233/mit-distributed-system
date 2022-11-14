@@ -308,11 +308,15 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// 将 log 砍到从 index + 1 开始的剩下部分，并将快照保存进 persister
 	// 这里用 defer 可以避免每个退出的地方都要解锁的问题
 	rf.raftState.rLock()
+	rf.snapshotLog("snapshot raft state lock success\n")
 	defer rf.raftState.rUnlock()
 	rf.logMutex.Lock()
+	rf.snapshotLog("snapshot log lock success\n")
 	defer rf.logMutex.Unlock()
 	rf.commitMutex.RLock()
+	rf.snapshotLog("snapshot commit lock success\n")
 	defer rf.commitMutex.RUnlock()
+	rf.snapshotLog("snapshot all lock success\n")
 	if rf.lastIncludedIndex >= index {
 		rf.snapshotLog("log until index %d has been snapshot before\n", index)
 		return
@@ -328,6 +332,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	leftLog := make([]LogEntry, 0)
 	startIndex := index + 1
 	for startIndex < rf.getLogLength() {
+		rf.snapshotLog("snapshotting log...\n")
 		leftLog = append(leftLog, rf.getLog(startIndex))
 		startIndex += 1
 	}
@@ -337,7 +342,9 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.persist()
 	var data []byte
 	rf.readPersist(data)
+	rf.snapshotLog("start save state and snapshot\n")
 	rf.persister.SaveStateAndSnapshot(data, snapshot)
+	rf.snapshotLog("state and snapshot saved\n")
 	rf.snapshotLog("finish snapshot\n")
 }
 
@@ -1111,6 +1118,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logReplicationDebug = true
 	rf.persistenceDebug = true
 	rf.snapshotDebug = true
+	//rf.electionDebug = false
+	//rf.logReplicationDebug = false
+	//rf.persistenceDebug = false
+	//rf.snapshotDebug = false
 	rf.raftState = MakeRaftState(rf)
 	// log[0] is unused, just to start at 1.
 	rf.log = make([]LogEntry, 1)

@@ -30,22 +30,22 @@ func (rs *RaftState) isState(state int) bool {
 }
 
 func (rs *RaftState) rLock() {
-	rs.rf.logReplicationLog("read lock raft state\n")
-	rs.rwmutex.RLock()
+	//rs.rf.logReplicationLog("read lock raft state\n")
+	rs.rwmutex.Lock()
 }
 
 func (rs *RaftState) rUnlock() {
-	rs.rf.logReplicationLog("read unlock raft state\n")
-	rs.rwmutex.RUnlock()
+	//rs.rf.logReplicationLog("read unlock raft state\n")
+	rs.rwmutex.Unlock()
 }
 
 func (rs *RaftState) wLock() {
-	rs.rf.logReplicationLog("lock raft state\n")
+	//rs.rf.logReplicationLog("lock raft state\n")
 	rs.rwmutex.Lock()
 }
 
 func (rs *RaftState) wUnlock() {
-	rs.rf.logReplicationLog("unlock raft state\n")
+	//rs.rf.logReplicationLog("unlock raft state\n")
 	rs.rwmutex.Unlock()
 }
 
