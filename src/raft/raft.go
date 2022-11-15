@@ -232,10 +232,10 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-// need to lock logMutex outside by caller
+// need to lock logMutex outside by caller, return max valid log index + 1
 func (rf *Raft) getLogLength() int {
-	// rf.lastIncludedIndex is init to -1, so if it has no snapshot, it returns len(rf.log)
-	return rf.lastIncludedIndex + len(rf.log) + 1
+	// ~~rf.lastIncludedIndex is init to -1, so if it has no snapshot, it returns len(rf.log)~~ 废除
+	return rf.lastIncludedIndex + len(rf.log)
 }
 
 func (rf *Raft) getTermOfLog(index int) int {
@@ -247,7 +247,7 @@ func (rf *Raft) getTermOfLog(index int) int {
 	} else if index == rf.lastIncludedIndex {
 		return rf.lastIncludedTerm
 	} else {
-		return rf.log[index-rf.lastIncludedIndex-1].Term
+		return rf.log[index-rf.lastIncludedIndex].Term
 	}
 	return -1
 }
@@ -259,12 +259,12 @@ func (rf *Raft) getLog(index int) LogEntry {
 	if index <= rf.lastIncludedIndex {
 		log.Fatalf("getLog: server %d has save log %d to snapshot\n", rf.me, index)
 	} else {
-		return rf.log[index-rf.lastIncludedIndex-1]
+		return rf.log[index-rf.lastIncludedIndex]
 	}
 	return LogEntry{}
 }
 
-// start 和 end 为真正的 index，即加上快照的 lastIncludedIndex 后的
+// start 和 end 为真正的 index，即加上快照的 lastIncludedIndex 后的，不包括 end log
 func (rf *Raft) getLogs(start int, end int) []LogEntry {
 	if end > rf.getLogLength() {
 		log.Fatalf("getLogs: server %d getLogs end %d overflow\n", rf.me, end)
@@ -272,11 +272,7 @@ func (rf *Raft) getLogs(start int, end int) []LogEntry {
 	if start <= rf.lastIncludedIndex {
 		log.Fatalf("getLogs: server %d has save log %d to snapshot\n", rf.me, start)
 	}
-	if rf.lastIncludedIndex >= 0 {
-		return rf.log[start-rf.lastIncludedIndex-1 : end-rf.lastIncludedIndex-1]
-	} else {
-		return rf.log[start:end]
-	}
+	return rf.log[start-rf.lastIncludedIndex : end-rf.lastIncludedIndex]
 }
 
 // start 为真正的 index，即加上快照的 lastIncludedIndex 后的
@@ -301,11 +297,11 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-	rf.snapshotLog("start snapshot\n")
+	rf.snapshotLog("start snapshot (to index %d)\n", index)
 	if rf.killed() {
 		return
 	}
-	// 将 log 砍到从 index + 1 开始的剩下部分，并将快照保存进 persister
+	// 将 log 砍到从 index 开始的剩下部分，并将快照保存进 persister
 	// 这里用 defer 可以避免每个退出的地方都要解锁的问题
 	rf.raftState.rLock()
 	rf.snapshotLog("snapshot raft state lock success\n")
@@ -319,6 +315,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.snapshotLog("snapshot all lock success\n")
 	if rf.lastIncludedIndex >= index {
 		rf.snapshotLog("log until index %d has been snapshot before\n", index)
+		rf.snapshotLog("snapshot has saved log until index %d\n", rf.lastIncludedIndex)
 		return
 	}
 	if rf.commitIndex < index {
@@ -330,7 +327,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 	leftLog := make([]LogEntry, 0)
-	startIndex := index + 1
+	startIndex := index
 	for startIndex < rf.getLogLength() {
 		rf.snapshotLog("snapshotting log...\n")
 		leftLog = append(leftLog, rf.getLog(startIndex))
@@ -362,9 +359,9 @@ type InstallSnapshotReply struct {
 	Term int
 }
 
-func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
-
-}
+//func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+//
+//}
 
 //
 // example RequestVote RPC arguments structure.
@@ -747,6 +744,7 @@ func (rf *Raft) sendHeartbeatToAll(thisTerm int) {
 
 // TODO: 经常有 potential deadlock 和这里有关, 但这里的上锁顺序似乎没什么大毛病
 func (rf *Raft) tryIncrementCommitIndex() {
+	rf.logReplicationLog("try increment commit index\n")
 	rf.raftState.rLock()
 	rf.logMutex.RLock()
 	rf.commitMutex.RLock()
@@ -756,6 +754,7 @@ func (rf *Raft) tryIncrementCommitIndex() {
 	rf.commitMutex.RUnlock()
 	rf.logMutex.RUnlock()
 	rf.raftState.rUnlock()
+	rf.logReplicationLog("try increment commit release lock\n")
 	for i := thisCommitIndex + 1; i < thisLogLength; i++ {
 		rf.logMutex.RLock()
 		nowLogTerm := rf.getTermOfLog(i)
@@ -774,6 +773,7 @@ func (rf *Raft) tryIncrementCommitIndex() {
 				rf.commitIndex = i
 				rf.logReplicationLog("most servers has the log %d, input 0 into applyNotifyCh\n", i)
 				rf.applyNotifyCh <- 0
+				rf.logReplicationLog("notify success\n")
 			}
 			rf.commitMutex.Unlock()
 		}
@@ -1066,9 +1066,20 @@ func (rf *Raft) applyLoop() {
 		// waiting for notify
 		_ = <-rf.applyNotifyCh
 		rf.logReplicationLog("applyNotifyCh recv notification\n")
+		needUpdate := false
+		rf.commitMutex.RLock()
 		if rf.commitIndex > rf.lastApplied {
+			needUpdate = true
+		}
+		rf.commitMutex.RUnlock()
+		rf.logReplicationLog("needUpdate: %v\n", needUpdate)
+		if needUpdate {
 			nextApplied := rf.lastApplied + 1
+			rf.logMutex.RLock()
+			rf.commitMutex.RLock()
 			toBeApplied := rf.getLogs(nextApplied, rf.commitIndex+1)
+			rf.commitMutex.RUnlock()
+			rf.logMutex.RUnlock()
 			rf.logReplicationLog("to be applied (from index %v): %v\n", nextApplied, toBeApplied)
 			// send to channel
 			// 注意！！！这里有可能会乱 go，导致顺序错误
@@ -1087,6 +1098,7 @@ func (rf *Raft) applyLoop() {
 					CommandValid: true,
 					CommandIndex: i + nextApplied,
 				}
+				rf.logReplicationLog("apply log %d success\n", i+nextApplied)
 			}
 			rf.logReplicationLog("apply %d entries (from index %v) to state machine\n", len(toBeApplied), nextApplied)
 			rf.lastApplied += len(toBeApplied)
@@ -1129,13 +1141,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Term:    0,
 		Command: nil,
 	}
-	rf.lastIncludedIndex = -1
-	rf.lastIncludedTerm = -1
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
 	rf.leaderInitDone = false
-	rf.applyNotifyCh = make(chan int)
+	rf.applyNotifyCh = make(chan int, 5)
 
 	// initialize from state persisted before a crash
 	rf.persistenceLog("remake and readPersist\n")
