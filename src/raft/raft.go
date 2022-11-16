@@ -333,12 +333,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		leftLog = append(leftLog, rf.getLog(startIndex))
 		startIndex += 1
 	}
-	rf.log = leftLog
-	rf.snapshotLog("now leftLog: %v\n", rf.log)
 	// 非常隐蔽的问题！ rf.lastIncludedTerm = rf.getTermOfLog(index) 不能写在后面，因为这一步的getTermOfLog是依赖于 rf.lastIncludedIndex 的，提前更新了之后，每次都获取之前的 lastIncludedTerm，也就是永远会为 0
+	// 但是，单纯换顺序也不对，因为 log 已经砍掉了，getTermOfLog 里也依赖 log, 这三者的更新顺序请注意
 	rf.lastIncludedTerm = rf.getTermOfLog(index)
 	rf.lastIncludedIndex = index
-	rf.snapshotLog("\n")
+	rf.log = leftLog
+	rf.snapshotLog("now leftLog: %v\n", rf.log)
 	rf.persist()
 	var data []byte
 	rf.readPersist(data)
