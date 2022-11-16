@@ -139,7 +139,7 @@ func (rf *Raft) logWithRaftStatus(format string, vars ...interface{}) {
 		break
 	}
 	rightHalf := fmt.Sprintf(format, vars...)
-	log.Printf("server %d %s in term %d votedFor %d commitIndex %d lastApplied %d leaderInitDone %v | %s", rf.me, stateString, rf.raftState.currentTerm, rf.raftState.votedFor, rf.commitIndex, rf.lastApplied, rf.leaderInitDone, rightHalf)
+	log.Printf("server %d %s in term %d votedFor %d commitIndex %d lastApplied %d leaderInitDone %v lastIncludedIndex %d lastIncludedTerm %v | %s", rf.me, stateString, rf.raftState.currentTerm, rf.raftState.votedFor, rf.commitIndex, rf.lastApplied, rf.leaderInitDone, rf.lastIncludedIndex, rf.lastIncludedTerm, rightHalf)
 }
 
 func (rf *Raft) electionLog(format string, vars ...interface{}) {
@@ -334,8 +334,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		startIndex += 1
 	}
 	rf.log = leftLog
-	rf.lastIncludedIndex = index
+	rf.snapshotLog("now leftLog: %v\n", rf.log)
+	// 非常隐蔽的问题！ rf.lastIncludedTerm = rf.getTermOfLog(index) 不能写在后面，因为这一步的getTermOfLog是依赖于 rf.lastIncludedIndex 的，提前更新了之后，每次都获取之前的 lastIncludedTerm，也就是永远会为 0
 	rf.lastIncludedTerm = rf.getTermOfLog(index)
+	rf.lastIncludedIndex = index
+	rf.snapshotLog("\n")
 	rf.persist()
 	var data []byte
 	rf.readPersist(data)
@@ -478,6 +481,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.raftState.wUnlock()
 		return
 	}
+	rf.logReplicationLog("args.PrevLogIndex: %d, rf.getLogLength()-1: %d, rf.getTermOfLog(args.PrevLogIndex): %d, args.PrevLogTerm: %d\n", args.PrevLogIndex, rf.getLogLength()-1, rf.getTermOfLog(args.PrevLogIndex), args.PrevLogTerm)
 	// 只有 applied 才会被 snapshot，所以其实访问到被 snapshot 过的数据并不是那么常见的事
 	if args.PrevLogIndex > rf.getLogLength()-1 || (args.PrevLogIndex >= 0 && rf.getTermOfLog(args.PrevLogIndex) != args.PrevLogTerm) {
 		rf.logReplicationLog("server %d 's prev log not match, return false\n", args.LeaderId)
