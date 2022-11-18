@@ -1189,6 +1189,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persistenceLog("remake and readPersist\n")
 	rf.readPersist(persister.ReadRaftState())
 
+	if rf.lastIncludedIndex > 0 {
+		rf.commitIndex = rf.lastIncludedIndex
+		rf.lastApplied = rf.lastIncludedIndex
+	}
+
 	seed := time.Now().UnixNano()
 	rand.Seed(seed)
 	rf.electionLog("rand seed: %v\n", seed)
