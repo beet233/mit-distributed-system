@@ -716,6 +716,10 @@ Copy on Write 指借用 Linux 的 fork，直接先上锁暂停，fork 一个一�
 
 参考了：[深入Raft中的日志压缩 - 知乎 (zhihu.com)](https://zhuanlan.zhihu.com/p/334610146)
 
+
+
+然鹅，实际上这个 lab 里并不需要关注这一点。
+
 #### How functions of 2D would be used?
 
 + ```go
@@ -757,6 +761,57 @@ Copy on Write 指借用 Linux 的 fork，直接先上锁暂停，fork 一个一�
 #### Save lastIncludedIndex and lastIncludedTerm
 
 快照中包含的最后一项 log 的信息应当被保存为 raft 的 state，并且也由 persister 进行持久化。
+
+### Main Idea
+
+#### Log Index Wrapping
+
+这里面的一大问题是，在经过了 Snapshot 后，日志只剩下后面的部分，所以原来的代码里需要做全面的下标（index）更换。以及，我们需要为 Raft 增加两个状态：`lastIncludedIndex`，`lastIncludedTerm`，来记录 Snapshot 到哪里了。因为这两个实际上是日志的部分，所以和 log 共用 `logMutex`，并且需要一起持久化哟~
+
+还有一点，我们依然要保持 log[0] 是没什么屁用的，所以 `lastIncludedIndex` 这一条可以保留下来当 log[0] ，实际有效的从 log[1] 开始。
+
+```go
+// need to lock logMutex outside by caller, return max valid log index + 1
+func (rf *Raft) getLogLength() int {
+   return rf.lastIncludedIndex + len(rf.log)
+}
+
+func (rf *Raft) getLog(index int) LogEntry {
+	if index >= rf.getLogLength() {
+		log.Fatalf("getLog: server %d does not have log %d yet\n", rf.me, index)
+	}
+	if index <= rf.lastIncludedIndex {
+		log.Fatalf("getLog: server %d has save log %d to snapshot\n", rf.me, index)
+	} else {
+		return rf.log[index-rf.lastIncludedIndex]
+	}
+	return LogEntry{}
+}
+```
+
+#### Prevent from Index Overflow
+
+因为很多 log 被包含进了 Snapshot 里，所以一旦要读取更早的日志，可能就要 InstallSnapshot 了，这很浪费时间，我们需要避免没必要的 Index Overflow。
+
+首先，在我写的过程中发现了 lastIncludedIndex 和 nextIndex、matchIndex 等数据发生倒退的情况，这些数据都是不应该倒退的，倒退了很有可能就访问 snapshot 里的日志了。发生倒退的原因基本上是因为并发高了，反应不过来，导致时序错乱，小的覆盖大的。为他们加上保护措施，只有增加才修改数值。
+
+#### When Own lastIncludedIndex is larger than PrevLogIndex
+
+有些运气差的时候，发现 leader 发来的 PrevLogIndex 比本 follower 的快照 index 还要小。但在别的 bug （特别是 nextIndex 相关的）修完后，这件事情好像不复存在了，因为 leader 一定拥有所有已经 applied 的日志，所以 PrevLogIndex 不会比其他 follower 的快照 index 小。
+
+加了个小处理，现在看来可能是无用功：
+
+```go
+if rf.lastIncludedIndex > args.PrevLogIndex {
+    rf.snapshotLog("prevLogIndex smaller than snapshot lastIncludedIndex\n")
+    reply.Success = false
+    // 从日志+1开始，因为日志都是 applied 的，所以 leader 一定有
+    reply.NextRetryStartIndex = rf.lastIncludedIndex + 1
+    rf.logMutex.Unlock()
+    rf.raftState.wUnlock()
+    return
+}
+```
 
 ## Backup
 

@@ -235,7 +235,6 @@ func (rf *Raft) readPersist(data []byte) {
 
 // need to lock logMutex outside by caller, return max valid log index + 1
 func (rf *Raft) getLogLength() int {
-	// ~~rf.lastIncludedIndex is init to -1, so if it has no snapshot, it returns len(rf.log)~~ 废除
 	return rf.lastIncludedIndex + len(rf.log)
 }
 
