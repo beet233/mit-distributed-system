@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"runtime/debug"
 	"time"
 
 	//	"bytes"
@@ -240,9 +241,11 @@ func (rf *Raft) getLogLength() int {
 
 func (rf *Raft) getTermOfLog(index int) int {
 	if index >= rf.getLogLength() {
+		debug.PrintStack()
 		log.Fatalf("getTermOfLog: server %d does not have log %d yet\n", rf.me, index)
 	}
 	if index < rf.lastIncludedIndex {
+		debug.PrintStack()
 		log.Fatalf("getTermOfLog: server %d has save log %d to snapshot\n", rf.me, index)
 	} else if index == rf.lastIncludedIndex {
 		return rf.lastIncludedTerm
@@ -481,7 +484,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.raftState.wUnlock()
 		return
 	}
-	rf.logReplicationLog("args.PrevLogIndex: %d, rf.getLogLength()-1: %d, rf.getTermOfLog(args.PrevLogIndex): %d, args.PrevLogTerm: %d\n", args.PrevLogIndex, rf.getLogLength()-1, rf.getTermOfLog(args.PrevLogIndex), args.PrevLogTerm)
+	if rf.lastIncludedIndex > args.PrevLogIndex {
+		rf.snapshotLog("prevLogIndex smaller than snapshot lastIncludedIndex\n")
+		reply.Success = false
+		// 从日志+1开始，因为日志都是 applied 的，所以 leader 一定有
+		reply.NextRetryStartIndex = rf.lastIncludedIndex + 1
+		rf.logMutex.Unlock()
+		rf.raftState.wUnlock()
+		return
+	}
+	// 这里不能直接 log rf.getTermOfLog，有可能是非法的
+	// rf.logReplicationLog("args.PrevLogIndex: %d, rf.getLogLength()-1: %d, rf.getTermOfLog(args.PrevLogIndex): %d, args.PrevLogTerm: %d\n", args.PrevLogIndex, rf.getLogLength()-1, rf.getTermOfLog(args.PrevLogIndex), args.PrevLogTerm)
 	// 只有 applied 才会被 snapshot，所以其实访问到被 snapshot 过的数据并不是那么常见的事
 	if args.PrevLogIndex > rf.getLogLength()-1 || (args.PrevLogIndex >= 0 && rf.getTermOfLog(args.PrevLogIndex) != args.PrevLogTerm) {
 		rf.logReplicationLog("server %d 's prev log not match, return false\n", args.LeaderId)
@@ -733,6 +746,7 @@ func (rf *Raft) sendHeartbeatToAll(thisTerm int) {
 		if reply.ok {
 			rf.electionLog("get heartbeat reply from server %d\n", reply.from)
 			rf.raftState.wLock()
+			rf.peerLogMutex.Lock()
 			if reply.reply.Term > rf.raftState.currentTerm {
 				rf.electionLog("turn into follower for term update\n")
 				rf.raftState.currentTerm = reply.reply.Term
@@ -741,12 +755,28 @@ func (rf *Raft) sendHeartbeatToAll(thisTerm int) {
 				rf.persist()
 				rf.logMutex.RUnlock()
 			}
+			if reply.reply.Success {
+				rf.logReplicationLog("server %d heartbeat success!\n", reply.from)
+				// update nextIndex and matchIndex
+				// 注意，这里有可能出现倒退的情况，因为并发度比较高时，消息的传回顺序完全可能是错乱的，我们需要保证这俩玩意儿是递增的，不然在有 snapshot 的情况下，可能就无意义地触及到已经变成快照的 Log 了
+				// heartbeat 没有发送 entries，成功则说明 PrevLogIndex 处是匹配的
+				if reply.args.PrevLogIndex > rf.matchIndex[reply.from] {
+					rf.matchIndex[reply.from] = reply.args.PrevLogIndex
+					rf.nextIndex[reply.from] = rf.matchIndex[reply.from] + 1
+					rf.logReplicationLog("server %d 's matchIndex update to %d\n", reply.from, rf.matchIndex[reply.from])
+					rf.logReplicationLog("server %d 's nextIndex update to %d\n", reply.from, rf.nextIndex[reply.from])
+					// 更新 nextIndex 和 matchIndex 成功，尝试一下 commit 以及 apply
+					go rf.tryIncrementCommitIndex()
+				}
+			}
+			rf.peerLogMutex.Unlock()
 			rf.raftState.wUnlock()
 		}
 	}
 }
 
 // TODO: 经常有 potential deadlock 和这里有关, 但这里的上锁顺序似乎没什么大毛病
+// only for leader，followers' commitIndex is updated by AppendEntries.
 func (rf *Raft) tryIncrementCommitIndex() {
 	rf.logReplicationLog("try increment commit index\n")
 	rf.raftState.rLock()
@@ -821,7 +851,9 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 		reply := <-replyChannel
 		// 所以这里再判断一次，并且只有在提前判断&&锁住raftState的情况下，我们才能保证leaderTermSmaller这个bool的正确性
 		rf.raftState.wLock()
+		rf.peerLogMutex.Lock()
 		if rf.raftState.currentTerm > thisTerm || rf.raftState.state != leaderState {
+			rf.peerLogMutex.Unlock()
 			rf.raftState.wUnlock()
 			break
 		}
@@ -841,11 +873,13 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 				rf.logReplicationLog("server %d append success!\n", reply.from)
 				successCount += 1
 				// update nextIndex and matchIndex
-				rf.logReplicationLog("server %d 's matchIndex update to %d\n", reply.from, reply.args.PrevLogIndex+len(reply.args.Entries))
-				rf.peerLogMutex.Lock()
-				rf.matchIndex[reply.from] = reply.args.PrevLogIndex + len(reply.args.Entries)
-				rf.nextIndex[reply.from] = rf.matchIndex[reply.from] + 1
-				rf.peerLogMutex.Unlock()
+				// 注意，这里有可能出现倒退的情况，因为并发度比较高时，消息的传回顺序完全可能是错乱的，我们需要保证这俩玩意儿是递增的，不然在有 snapshot 的情况下，可能就无意义地触及到已经变成快照的 Log 了
+				if reply.args.PrevLogIndex+len(reply.args.Entries) > rf.matchIndex[reply.from] {
+					rf.matchIndex[reply.from] = reply.args.PrevLogIndex + len(reply.args.Entries)
+					rf.nextIndex[reply.from] = rf.matchIndex[reply.from] + 1
+					rf.logReplicationLog("server %d 's matchIndex update to %d\n", reply.from, rf.matchIndex[reply.from])
+					rf.logReplicationLog("server %d 's nextIndex update to %d\n", reply.from, rf.nextIndex[reply.from])
+				}
 				// 每有成功的 AppendEntries 返回时，就尝试一下 commit 以及 apply
 				go rf.tryIncrementCommitIndex()
 			} else if !leaderTermSmaller {
@@ -853,7 +887,6 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 				rf.logReplicationLog("server %d append failed and retry!\n", reply.from)
 				// decrement nextIndex and retry
 				// 根据我自己的逻辑判断，prevLogIndex 也是要 -- 的
-				rf.peerLogMutex.Lock()
 				//if rf.nextIndex[reply.from] > 1 {
 				//	rf.nextIndex[reply.from] -= 1
 				//}
@@ -873,7 +906,6 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 				newArgs.Entries = rf.getLogsFrom(rf.nextIndex[reply.from])
 				rf.logReplicationLog("newArgs | to: %v, prevLogIndex: %v, entries: %v\n", reply.from, newArgs.PrevLogIndex, newArgs.Entries)
 				rf.logMutex.RUnlock()
-				rf.peerLogMutex.Unlock()
 				var newReply AppendEntriesReply
 				go rf.sendAppendEntriesWithChannelReply(reply.from, &newArgs, &newReply, replyChannel)
 			}
@@ -883,6 +915,7 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 			var newReply AppendEntriesReply
 			go rf.sendAppendEntriesWithChannelReply(reply.from, &reply.args, &newReply, replyChannel)
 		}
+		rf.peerLogMutex.Unlock()
 		rf.raftState.wUnlock()
 	}
 }
