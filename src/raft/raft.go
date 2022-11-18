@@ -1161,14 +1161,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.electionDebug = true
-	rf.logReplicationDebug = true
-	rf.persistenceDebug = true
-	rf.snapshotDebug = true
-	//rf.electionDebug = false
-	//rf.logReplicationDebug = false
-	//rf.persistenceDebug = false
-	//rf.snapshotDebug = false
+	//rf.electionDebug = true
+	//rf.logReplicationDebug = true
+	//rf.persistenceDebug = true
+	//rf.snapshotDebug = true
+	rf.electionDebug = false
+	rf.logReplicationDebug = false
+	rf.persistenceDebug = false
+	rf.snapshotDebug = false
 	rf.raftState = MakeRaftState(rf)
 	// log[0] is unused, just to start at 1.
 	rf.log = make([]LogEntry, 1)
@@ -1182,7 +1182,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
 	rf.leaderInitDone = false
-	rf.applyNotifyCh = make(chan int, 5)
+	rf.applyNotifyCh = make(chan int, 10)
 
 	// initialize from state persisted before a crash
 	rf.persistenceLog("remake and readPersist\n")
