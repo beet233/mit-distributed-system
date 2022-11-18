@@ -827,7 +827,6 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 			// 这里的prevLogIndex 定义是 “index of log entry immediately preceding
 			// new ones”，但我实际发送的是从 nextIndex 开始的 Entries，对那个 server 来说从这里开始都是 new ones，
 			// 所以也应该让 prevLogIndex 为 nextIndex -1
-			// prevLogIndex := len(rf.log) - 2
 			prevLogIndex := rf.nextIndex[i] - 1
 			prevLogTerm := rf.getTermOfLog(prevLogIndex)
 			rf.commitMutex.RLock()
@@ -983,7 +982,7 @@ func (rf *Raft) sendRequestVoteToAll(thisTerm int) {
 			continue
 		}
 		rf.logMutex.RLock()
-		args := RequestVoteArgs{thisTerm, rf.me, len(rf.log) - 1, rf.getTermOfLog(rf.getLogLength() - 1)}
+		args := RequestVoteArgs{thisTerm, rf.me, rf.getLogLength() - 1, rf.getTermOfLog(rf.getLogLength() - 1)}
 		rf.logMutex.RUnlock()
 		var reply RequestVoteReply
 		go rf.sendRequestVoteWithChannelReply(i, &args, &reply, replyChannel)
