@@ -364,9 +364,55 @@ type InstallSnapshotReply struct {
 	Term int
 }
 
-//func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
-//
-//}
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.raftState.wLock()
+	defer rf.raftState.wUnlock()
+	rf.logMutex.Lock()
+	defer rf.logMutex.Unlock()
+	if args.Term >= rf.raftState.currentTerm {
+		if args.Term > rf.raftState.currentTerm {
+			rf.electionLog("update term and become follower if needed\n")
+			rf.raftState.currentTerm = args.Term
+			rf.raftState.votedFor = -1
+			rf.raftState.state = followerState
+			rf.persist()
+		}
+		if rf.lastIncludedIndex < args.LastIncludedIndex {
+			// 保留 args.LastIncludedIndex 后的日志，更新 lastIncludedIndex 和 lastIncludedTerm
+			leftLog := make([]LogEntry, 0)
+			startIndex := args.LastIncludedIndex
+			for startIndex < rf.getLogLength() {
+				rf.snapshotLog("installing snapshot log...\n")
+				leftLog = append(leftLog, rf.getLog(startIndex))
+				startIndex += 1
+			}
+			rf.lastIncludedTerm = args.LastIncludedTerm
+			rf.lastIncludedIndex = args.LastIncludedIndex
+			rf.log = leftLog
+			if args.LastIncludedIndex > rf.commitIndex {
+				rf.commitIndex = args.LastIncludedIndex
+			}
+			if args.LastIncludedIndex > rf.lastApplied {
+				rf.lastApplied = args.LastIncludedIndex
+			}
+			rf.persist()
+			var data []byte
+			rf.readPersist(data)
+			rf.snapshotLog("start save state and snapshot\n")
+			rf.persister.SaveStateAndSnapshot(data, args.Data)
+			rf.snapshotLog("state and snapshot saved\n")
+			rf.snapshotLog("finish install snapshot\n")
+			msg := ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      args.Data,
+				SnapshotTerm:  rf.lastIncludedTerm,
+				SnapshotIndex: rf.lastIncludedIndex,
+			}
+			rf.applyCh <- msg
+		}
+	}
+	reply.Term = rf.raftState.currentTerm
+}
 
 //
 // example RequestVote RPC arguments structure.
@@ -1161,14 +1207,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	//rf.electionDebug = true
-	//rf.logReplicationDebug = true
-	//rf.persistenceDebug = true
-	//rf.snapshotDebug = true
-	rf.electionDebug = false
-	rf.logReplicationDebug = false
-	rf.persistenceDebug = false
-	rf.snapshotDebug = false
+	rf.electionDebug = true
+	rf.logReplicationDebug = true
+	rf.persistenceDebug = true
+	rf.snapshotDebug = true
+	//rf.electionDebug = false
+	//rf.logReplicationDebug = false
+	//rf.persistenceDebug = false
+	//rf.snapshotDebug = false
 	rf.raftState = MakeRaftState(rf)
 	// log[0] is unused, just to start at 1.
 	rf.log = make([]LogEntry, 1)
