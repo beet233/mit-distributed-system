@@ -378,12 +378,17 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			rf.raftState.state = followerState
 			rf.persist()
 		}
-		if rf.lastIncludedIndex < args.LastIncludedIndex {
+		// 发来的快照比我新，我才更新，不然更新个屁
+		if rf.lastIncludedIndex < args.LastIncludedIndex && rf.lastApplied < args.LastIncludedIndex {
 			// 保留 args.LastIncludedIndex 后的日志，更新 lastIncludedIndex 和 lastIncludedTerm
 			leftLog := make([]LogEntry, 0)
-			startIndex := args.LastIncludedIndex
+			leftLog = append(leftLog, LogEntry{
+				Term:    0,
+				Command: nil,
+			})
+			startIndex := args.LastIncludedIndex + 1
 			for startIndex < rf.getLogLength() {
-				rf.snapshotLog("installing snapshot log...\n")
+				rf.snapshotLog("keep log after snapshot...\n")
 				leftLog = append(leftLog, rf.getLog(startIndex))
 				startIndex += 1
 			}
@@ -543,7 +548,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// rf.logReplicationLog("args.PrevLogIndex: %d, rf.getLogLength()-1: %d, rf.getTermOfLog(args.PrevLogIndex): %d, args.PrevLogTerm: %d\n", args.PrevLogIndex, rf.getLogLength()-1, rf.getTermOfLog(args.PrevLogIndex), args.PrevLogTerm)
 	// 只有 applied 才会被 snapshot，所以其实访问到被 snapshot 过的数据并不是那么常见的事
 	if args.PrevLogIndex > rf.getLogLength()-1 || (args.PrevLogIndex >= 0 && rf.getTermOfLog(args.PrevLogIndex) != args.PrevLogTerm) {
-		rf.logReplicationLog("server %d 's prev log not match, return false\n", args.LeaderId)
+		rf.snapshotLog("log: %v\n", rf.log)
+		rf.logReplicationLog("server %d 's prev log (index: %d, term: %d) not match, return false\n", args.LeaderId, args.PrevLogIndex, args.PrevLogTerm)
 		reply.Success = false
 		if args.PrevLogIndex > rf.getLogLength()-1 {
 			reply.NextRetryStartIndex = rf.getLogLength()
@@ -571,7 +577,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if args.PrevLogIndex+1+i > rf.getLogLength()-1 {
 				rf.log = append(rf.log, args.Entries[i])
 			} else if rf.getTermOfLog(args.PrevLogIndex+1+i) != args.Entries[i].Term {
-				rf.log = rf.log[0 : args.PrevLogIndex+1+i]
+				rf.log = rf.log[0 : args.PrevLogIndex+1+i-rf.lastIncludedIndex]
 				rf.log = append(rf.log, args.Entries[i])
 			}
 		}
@@ -814,7 +820,7 @@ func (rf *Raft) sendAppendEntries(to int, args *AppendEntriesArgs, reply *Append
 				if reply.NextRetryStartIndex == 0 {
 					log.Fatalf("ERROR: NextRetryStartIndex is 0!!\n")
 				}
-				// TODO: 如果 reply.reply.NextRetryStartIndex 已经被包含进快照里，没有实际 log 了，那么把快照发给 follower
+				// 如果 reply.NextRetryStartIndex 已经被包含进快照里，没有实际 log 了，那么把快照发给 follower
 				rf.logMutex.RLock()
 				if reply.NextRetryStartIndex <= rf.lastIncludedIndex {
 					go rf.sendInstallSnapshot(to,
@@ -888,7 +894,31 @@ func (rf *Raft) sendInstallSnapshot(to int, args *InstallSnapshotArgs, reply *In
 			rf.peerLogMutex.Lock()
 			rf.matchIndex[to] = args.LastIncludedIndex
 			rf.nextIndex[to] = args.LastIncludedIndex + 1
-			// TODO: 是不是应该在发完 snapshot 后继续发剩下的 Log ？
+			// 在发完 snapshot 后继续发剩下的 Log，如果新的 snapshot 又超越了，那么继续发 snapshot，不然就发普通 append
+			prevLogIndex := rf.nextIndex[to] - 1
+			rf.logMutex.RLock()
+			if rf.lastIncludedIndex > prevLogIndex {
+				go rf.sendInstallSnapshot(to,
+					&InstallSnapshotArgs{
+						args.Term,
+						rf.me,
+						rf.lastIncludedIndex,
+						rf.lastIncludedTerm,
+						rf.persister.ReadSnapshot(),
+					},
+					&InstallSnapshotReply{})
+				rf.logMutex.RUnlock()
+				rf.peerLogMutex.Unlock()
+				rf.raftState.wUnlock()
+				return
+			}
+			prevLogTerm := rf.getTermOfLog(prevLogIndex)
+			rf.commitMutex.RLock()
+			appendArgs := AppendEntriesArgs{args.Term, rf.me, rf.getLogsFrom(rf.nextIndex[to]), prevLogIndex, prevLogTerm, rf.commitIndex}
+			var appendReply AppendEntriesReply
+			go rf.sendAppendEntries(to, &appendArgs, &appendReply)
+			rf.commitMutex.RUnlock()
+			rf.logMutex.RUnlock()
 			rf.peerLogMutex.Unlock()
 			rf.raftState.wUnlock()
 			return
@@ -985,7 +1015,15 @@ func (rf *Raft) tryIncrementCommitIndex() {
 	rf.logReplicationLog("try increment commit release lock\n")
 	for i := thisCommitIndex + 1; i < thisLogLength; i++ {
 		rf.logMutex.RLock()
+		rf.commitMutex.RLock()
+		if i <= rf.lastIncludedIndex {
+			i = rf.lastIncludedIndex
+			rf.commitMutex.RUnlock()
+			rf.logMutex.RUnlock()
+			continue
+		}
 		nowLogTerm := rf.getTermOfLog(i)
+		rf.commitMutex.RUnlock()
 		rf.logMutex.RUnlock()
 		if nowLogTerm == thisTerm {
 			count := 0
@@ -1022,6 +1060,18 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 			// new ones”，但我实际发送的是从 nextIndex 开始的 Entries，对那个 server 来说从这里开始都是 new ones，
 			// 所以也应该让 prevLogIndex 为 nextIndex -1
 			prevLogIndex := rf.nextIndex[i] - 1
+			if rf.lastIncludedIndex > prevLogIndex {
+				go rf.sendInstallSnapshot(i,
+					&InstallSnapshotArgs{
+						thisTerm,
+						rf.me,
+						rf.lastIncludedIndex,
+						rf.lastIncludedTerm,
+						rf.persister.ReadSnapshot(),
+					},
+					&InstallSnapshotReply{})
+				continue
+			}
 			prevLogTerm := rf.getTermOfLog(prevLogIndex)
 			rf.commitMutex.RLock()
 			args := AppendEntriesArgs{thisTerm, rf.me, rf.getLogsFrom(rf.nextIndex[i]), prevLogIndex, prevLogTerm, rf.commitIndex}
@@ -1352,14 +1402,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	//rf.electionDebug = true
-	//rf.logReplicationDebug = true
-	//rf.persistenceDebug = true
-	//rf.snapshotDebug = true
-	rf.electionDebug = false
-	rf.logReplicationDebug = false
-	rf.persistenceDebug = false
-	rf.snapshotDebug = false
+	rf.electionDebug = true
+	rf.logReplicationDebug = true
+	rf.persistenceDebug = true
+	rf.snapshotDebug = true
+	//rf.electionDebug = false
+	//rf.logReplicationDebug = false
+	//rf.persistenceDebug = false
+	//rf.snapshotDebug = false
 	rf.raftState = MakeRaftState(rf)
 	// log[0] is unused, just to start at 1.
 	rf.log = make([]LogEntry, 1)
