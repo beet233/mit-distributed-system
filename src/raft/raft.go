@@ -369,6 +369,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	defer rf.raftState.wUnlock()
 	rf.logMutex.Lock()
 	defer rf.logMutex.Unlock()
+	rf.snapshotLog("start install snapshot\n")
 	if args.Term >= rf.raftState.currentTerm {
 		if args.Term > rf.raftState.currentTerm {
 			rf.electionLog("update term and become follower if needed\n")
@@ -750,6 +751,136 @@ type WrappedAppendEntriesReply struct {
 	reply AppendEntriesReply
 }
 
+func (rf *Raft) sendAppendEntriesWithChannelReply(to int, args *AppendEntriesArgs, reply *AppendEntriesReply, replyChannel chan WrappedAppendEntriesReply) {
+	// 失败的也要传回 channel ，提供 retry 的契机
+	ok := rf.peers[to].Call("Raft.AppendEntries", args, reply)
+	wrappedReply := WrappedAppendEntriesReply{ok, to, *args, *reply}
+	replyChannel <- wrappedReply
+}
+
+func (rf *Raft) sendAppendEntries(to int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	for {
+		// 这里也检查一遍 term 和 state，避免网络不好的时候一直重发
+		rf.raftState.wLock()
+		if rf.raftState.currentTerm != args.Term || !rf.raftState.isState(leaderState) {
+			rf.raftState.wUnlock()
+			return
+		}
+		rf.raftState.wUnlock()
+		ok := rf.peers[to].Call("Raft.AppendEntries", args, reply)
+		if ok {
+			rf.raftState.wLock()
+			rf.peerLogMutex.Lock()
+			if rf.raftState.currentTerm != args.Term || !rf.raftState.isState(leaderState) {
+				rf.peerLogMutex.Unlock()
+				rf.raftState.wUnlock()
+				return
+			}
+			rf.logReplicationLog("get AppendEntries reply from server %d\n", to)
+			leaderTermSmaller := false
+			if reply.Term > rf.raftState.currentTerm {
+				leaderTermSmaller = true
+				rf.electionLog("turn into follower for term update\n")
+				rf.raftState.currentTerm = reply.Term
+				rf.raftState.state = followerState
+				rf.raftState.votedFor = -1
+				rf.logMutex.RLock()
+				rf.persist()
+				rf.logMutex.RUnlock()
+			}
+			if reply.Success {
+				rf.logReplicationLog("server %d append success!\n", to)
+				// update nextIndex and matchIndex
+				// 注意，这里有可能出现倒退的情况，因为并发度比较高时，消息的传回顺序完全可能是错乱的，我们需要保证这俩玩意儿是递增的，不然在有 snapshot 的情况下，可能就无意义地触及到已经变成快照的 Log 了
+				if args.PrevLogIndex+len(args.Entries) > rf.matchIndex[to] {
+					rf.matchIndex[to] = args.PrevLogIndex + len(args.Entries)
+					rf.nextIndex[to] = rf.matchIndex[to] + 1
+					rf.logReplicationLog("server %d 's matchIndex update to %d\n", to, rf.matchIndex[to])
+					rf.logReplicationLog("server %d 's nextIndex update to %d\n", to, rf.nextIndex[to])
+				}
+				// 每有成功的 AppendEntries 返回时，就尝试一下 commit 以及 apply
+				go rf.tryIncrementCommitIndex()
+				rf.peerLogMutex.Unlock()
+				rf.raftState.wUnlock()
+				return
+			} else if !leaderTermSmaller {
+				// 只有在 log inconsistent 时重发，term 问题不用重发
+				rf.logReplicationLog("server %d append failed and retry!\n", to)
+				// decrement nextIndex and retry
+				// 根据我自己的逻辑判断，prevLogIndex 也是要 -- 的
+				//if rf.nextIndex[reply.from] > 1 {
+				//	rf.nextIndex[reply.from] -= 1
+				//}
+				if reply.NextRetryStartIndex == 0 {
+					log.Fatalf("ERROR: NextRetryStartIndex is 0!!\n")
+				}
+				// TODO: 如果 reply.reply.NextRetryStartIndex 已经被包含进快照里，没有实际 log 了，那么把快照发给 follower
+				rf.nextIndex[to] = reply.NextRetryStartIndex
+				// 这里的重发并不使用最新的 term 和 leader commit，而是保持原请求的值，只更新prev、entries
+				// 将 PrevLogIndex 直接和 nextIndex 绑定而不是简单递减，避免多个 append to all 并发时出现问题
+				args.PrevLogIndex = rf.nextIndex[to] - 1
+				rf.logMutex.RLock()
+				if args.PrevLogIndex >= 0 {
+					args.PrevLogTerm = rf.getTermOfLog(args.PrevLogIndex)
+				}
+				args.Entries = rf.getLogsFrom(rf.nextIndex[to])
+				rf.logReplicationLog("newArgs | to: %v, prevLogIndex: %v, entries: %v\n", to, args.PrevLogIndex, args.Entries)
+				rf.logMutex.RUnlock()
+			} else {
+				rf.peerLogMutex.Unlock()
+				rf.raftState.wUnlock()
+				return
+			}
+			rf.peerLogMutex.Unlock()
+			rf.raftState.wUnlock()
+		} else {
+			rf.logReplicationLog("server %d append failed (for network error) and retry!\n", to)
+		}
+		reply = &AppendEntriesReply{}
+	}
+}
+
+func (rf *Raft) sendInstallSnapshot(to int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	for {
+		// 这里也检查一遍 term 和 state，避免网络不好的时候一直重发
+		rf.raftState.wLock()
+		if rf.raftState.currentTerm != args.Term || !rf.raftState.isState(leaderState) {
+			rf.raftState.wUnlock()
+			return
+		}
+		rf.raftState.wUnlock()
+		rf.snapshotLog("send snapshot until %d to server %d\n", args.LastIncludedIndex, to)
+		ok := rf.peers[to].Call("Raft.InstallSnapshot", args, reply)
+		if ok {
+			rf.raftState.wLock()
+			if rf.raftState.currentTerm != args.Term || !rf.raftState.isState(leaderState) {
+				rf.raftState.wUnlock()
+				return
+			}
+			if reply.Term > rf.raftState.currentTerm {
+				rf.electionLog("turn into follower for term update\n")
+				rf.raftState.currentTerm = reply.Term
+				rf.raftState.state = followerState
+				rf.raftState.votedFor = -1
+				rf.logMutex.RLock()
+				rf.persist()
+				rf.logMutex.RUnlock()
+				rf.raftState.wUnlock()
+				return
+			}
+			rf.peerLogMutex.Lock()
+			rf.matchIndex[to] = args.LastIncludedIndex
+			rf.nextIndex[to] = args.LastIncludedIndex + 1
+			// TODO: 是不是应该在发完 snapshot 后继续发剩下的 Log ？
+			rf.peerLogMutex.Unlock()
+			rf.raftState.wUnlock()
+			return
+		} else {
+			rf.snapshotLog("server %d install snapshot failed (for network error) and retry!\n", to)
+		}
+	}
+}
+
 // 一些考虑：
 // 因为 heartbeat 一直在发，如果每个都有 fail 而不结束（比如有一个 peer 挂了），
 // 线程会堆积过多，导致不必要的内存占用
@@ -796,6 +927,7 @@ func (rf *Raft) sendHeartbeatToAll(thisTerm int) {
 				rf.electionLog("turn into follower for term update\n")
 				rf.raftState.currentTerm = reply.reply.Term
 				rf.raftState.state = followerState
+				rf.raftState.votedFor = -1
 				rf.logMutex.RLock()
 				rf.persist()
 				rf.logMutex.RUnlock()
@@ -860,7 +992,7 @@ func (rf *Raft) tryIncrementCommitIndex() {
 }
 
 func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
-	replyChannel := make(chan WrappedAppendEntriesReply, 10)
+	//replyChannel := make(chan WrappedAppendEntriesReply, 10)
 	rf.peerLogMutex.Lock()
 	rf.logMutex.RLock()
 	for i := 0; i < len(rf.peers); i++ {
@@ -878,97 +1010,92 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 			args := AppendEntriesArgs{thisTerm, rf.me, rf.getLogsFrom(rf.nextIndex[i]), prevLogIndex, prevLogTerm, rf.commitIndex}
 			rf.commitMutex.RUnlock()
 			var reply AppendEntriesReply
-			go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
+			//go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
+			go rf.sendAppendEntries(i, &args, &reply)
 		}
 	}
 	rf.logMutex.RUnlock()
 	rf.peerLogMutex.Unlock()
-	// process reply
-	successCount := 0
-	for {
-		// TODO: 这里的问题：无限重试什么时候停？
-		if successCount == len(rf.peers)-1 {
-			// all success
-			break
-		}
-		// 这里等待中途，完全有可能发生状态的改变
-		reply := <-replyChannel
-		// 所以这里再判断一次，并且只有在提前判断&&锁住raftState的情况下，我们才能保证leaderTermSmaller这个bool的正确性
-		rf.raftState.wLock()
-		rf.peerLogMutex.Lock()
-		if rf.raftState.currentTerm > thisTerm || rf.raftState.state != leaderState {
-			rf.peerLogMutex.Unlock()
-			rf.raftState.wUnlock()
-			break
-		}
-		if reply.ok {
-			rf.logReplicationLog("get AppendEntries reply from server %d\n", reply.from)
-			leaderTermSmaller := false
-			if reply.reply.Term > rf.raftState.currentTerm {
-				leaderTermSmaller = true
-				rf.electionLog("turn into follower for term update\n")
-				rf.raftState.currentTerm = reply.reply.Term
-				rf.raftState.state = followerState
-				rf.logMutex.RLock()
-				rf.persist()
-				rf.logMutex.RUnlock()
-			}
-			if reply.reply.Success {
-				rf.logReplicationLog("server %d append success!\n", reply.from)
-				successCount += 1
-				// update nextIndex and matchIndex
-				// 注意，这里有可能出现倒退的情况，因为并发度比较高时，消息的传回顺序完全可能是错乱的，我们需要保证这俩玩意儿是递增的，不然在有 snapshot 的情况下，可能就无意义地触及到已经变成快照的 Log 了
-				if reply.args.PrevLogIndex+len(reply.args.Entries) > rf.matchIndex[reply.from] {
-					rf.matchIndex[reply.from] = reply.args.PrevLogIndex + len(reply.args.Entries)
-					rf.nextIndex[reply.from] = rf.matchIndex[reply.from] + 1
-					rf.logReplicationLog("server %d 's matchIndex update to %d\n", reply.from, rf.matchIndex[reply.from])
-					rf.logReplicationLog("server %d 's nextIndex update to %d\n", reply.from, rf.nextIndex[reply.from])
-				}
-				// 每有成功的 AppendEntries 返回时，就尝试一下 commit 以及 apply
-				go rf.tryIncrementCommitIndex()
-			} else if !leaderTermSmaller {
-				// 只有在 log inconsistent 时重发，term 问题不用重发
-				rf.logReplicationLog("server %d append failed and retry!\n", reply.from)
-				// decrement nextIndex and retry
-				// 根据我自己的逻辑判断，prevLogIndex 也是要 -- 的
-				//if rf.nextIndex[reply.from] > 1 {
-				//	rf.nextIndex[reply.from] -= 1
-				//}
-				if reply.reply.NextRetryStartIndex == 0 {
-					log.Fatalf("ERROR: NextRetryStartIndex is 0!!\n")
-				}
-				// TODO: 如果 reply.reply.NextRetryStartIndex 已经被包含进快照里，没有实际 log 了，那么把快照发给 follower
-				rf.nextIndex[reply.from] = reply.reply.NextRetryStartIndex
-				// 这里的重发并不使用最新的 term 和 leader commit，而是保持原请求的值，只更新prev、entries
-				newArgs := reply.args
-				// 将 PrevLogIndex 直接和 nextIndex 绑定而不是简单递减，避免多个 append to all 并发时出现问题
-				newArgs.PrevLogIndex = rf.nextIndex[reply.from] - 1
-				rf.logMutex.RLock()
-				if newArgs.PrevLogIndex >= 0 {
-					newArgs.PrevLogTerm = rf.getTermOfLog(newArgs.PrevLogIndex)
-				}
-				newArgs.Entries = rf.getLogsFrom(rf.nextIndex[reply.from])
-				rf.logReplicationLog("newArgs | to: %v, prevLogIndex: %v, entries: %v\n", reply.from, newArgs.PrevLogIndex, newArgs.Entries)
-				rf.logMutex.RUnlock()
-				var newReply AppendEntriesReply
-				go rf.sendAppendEntriesWithChannelReply(reply.from, &newArgs, &newReply, replyChannel)
-			}
-		} else {
-			// resend same failed msg for network error
-			rf.logReplicationLog("server %d append failed (for network error) and retry!\n", reply.from)
-			var newReply AppendEntriesReply
-			go rf.sendAppendEntriesWithChannelReply(reply.from, &reply.args, &newReply, replyChannel)
-		}
-		rf.peerLogMutex.Unlock()
-		rf.raftState.wUnlock()
-	}
-}
-
-func (rf *Raft) sendAppendEntriesWithChannelReply(to int, args *AppendEntriesArgs, reply *AppendEntriesReply, replyChannel chan WrappedAppendEntriesReply) {
-	// 失败的也要传回 channel ，提供 retry 的契机
-	ok := rf.peers[to].Call("Raft.AppendEntries", args, reply)
-	wrappedReply := WrappedAppendEntriesReply{ok, to, *args, *reply}
-	replyChannel <- wrappedReply
+	//// process reply
+	//successCount := 0
+	//for {
+	//	// TODO: 这里的问题：无限重试什么时候停？
+	//	if successCount == len(rf.peers)-1 {
+	//		// all success
+	//		break
+	//	}
+	//	// 这里等待中途，完全有可能发生状态的改变
+	//	reply := <-replyChannel
+	//	// 所以这里再判断一次，并且只有在提前判断&&锁住raftState的情况下，我们才能保证leaderTermSmaller这个bool的正确性
+	//	rf.raftState.wLock()
+	//	rf.peerLogMutex.Lock()
+	//	if rf.raftState.currentTerm > thisTerm || rf.raftState.state != leaderState {
+	//		rf.peerLogMutex.Unlock()
+	//		rf.raftState.wUnlock()
+	//		break
+	//	}
+	//	if reply.ok {
+	//		rf.logReplicationLog("get AppendEntries reply from server %d\n", reply.from)
+	//		leaderTermSmaller := false
+	//		if reply.reply.Term > rf.raftState.currentTerm {
+	//			leaderTermSmaller = true
+	//			rf.electionLog("turn into follower for term update\n")
+	//			rf.raftState.currentTerm = reply.reply.Term
+	//			rf.raftState.state = followerState
+	//			rf.raftState.votedFor = -1
+	//			rf.logMutex.RLock()
+	//			rf.persist()
+	//			rf.logMutex.RUnlock()
+	//		}
+	//		if reply.reply.Success {
+	//			rf.logReplicationLog("server %d append success!\n", reply.from)
+	//			successCount += 1
+	//			// update nextIndex and matchIndex
+	//			// 注意，这里有可能出现倒退的情况，因为并发度比较高时，消息的传回顺序完全可能是错乱的，我们需要保证这俩玩意儿是递增的，不然在有 snapshot 的情况下，可能就无意义地触及到已经变成快照的 Log 了
+	//			if reply.args.PrevLogIndex+len(reply.args.Entries) > rf.matchIndex[reply.from] {
+	//				rf.matchIndex[reply.from] = reply.args.PrevLogIndex + len(reply.args.Entries)
+	//				rf.nextIndex[reply.from] = rf.matchIndex[reply.from] + 1
+	//				rf.logReplicationLog("server %d 's matchIndex update to %d\n", reply.from, rf.matchIndex[reply.from])
+	//				rf.logReplicationLog("server %d 's nextIndex update to %d\n", reply.from, rf.nextIndex[reply.from])
+	//			}
+	//			// 每有成功的 AppendEntries 返回时，就尝试一下 commit 以及 apply
+	//			go rf.tryIncrementCommitIndex()
+	//		} else if !leaderTermSmaller {
+	//			// 只有在 log inconsistent 时重发，term 问题不用重发
+	//			rf.logReplicationLog("server %d append failed and retry!\n", reply.from)
+	//			// decrement nextIndex and retry
+	//			// 根据我自己的逻辑判断，prevLogIndex 也是要 -- 的
+	//			//if rf.nextIndex[reply.from] > 1 {
+	//			//	rf.nextIndex[reply.from] -= 1
+	//			//}
+	//			if reply.reply.NextRetryStartIndex == 0 {
+	//				log.Fatalf("ERROR: NextRetryStartIndex is 0!!\n")
+	//			}
+	//			// TODO: 如果 reply.reply.NextRetryStartIndex 已经被包含进快照里，没有实际 log 了，那么把快照发给 follower
+	//			rf.nextIndex[reply.from] = reply.reply.NextRetryStartIndex
+	//			// 这里的重发并不使用最新的 term 和 leader commit，而是保持原请求的值，只更新prev、entries
+	//			newArgs := reply.args
+	//			// 将 PrevLogIndex 直接和 nextIndex 绑定而不是简单递减，避免多个 append to all 并发时出现问题
+	//			newArgs.PrevLogIndex = rf.nextIndex[reply.from] - 1
+	//			rf.logMutex.RLock()
+	//			if newArgs.PrevLogIndex >= 0 {
+	//				newArgs.PrevLogTerm = rf.getTermOfLog(newArgs.PrevLogIndex)
+	//			}
+	//			newArgs.Entries = rf.getLogsFrom(rf.nextIndex[reply.from])
+	//			rf.logReplicationLog("newArgs | to: %v, prevLogIndex: %v, entries: %v\n", reply.from, newArgs.PrevLogIndex, newArgs.Entries)
+	//			rf.logMutex.RUnlock()
+	//			var newReply AppendEntriesReply
+	//			go rf.sendAppendEntriesWithChannelReply(reply.from, &newArgs, &newReply, replyChannel)
+	//		}
+	//	} else {
+	//		// resend same failed msg for network error
+	//		rf.logReplicationLog("server %d append failed (for network error) and retry!\n", reply.from)
+	//		var newReply AppendEntriesReply
+	//		go rf.sendAppendEntriesWithChannelReply(reply.from, &reply.args, &newReply, replyChannel)
+	//	}
+	//	rf.peerLogMutex.Unlock()
+	//	rf.raftState.wUnlock()
+	//}
 }
 
 func (rf *Raft) leaderMain() {
@@ -1046,6 +1173,7 @@ func (rf *Raft) sendRequestVoteToAll(thisTerm int) {
 				rf.electionLog("turn into follower for term update\n")
 				rf.raftState.currentTerm = reply.reply.Term
 				rf.raftState.state = followerState
+				rf.raftState.votedFor = -1
 				rf.logMutex.RLock()
 				rf.persist()
 				rf.logMutex.RUnlock()
@@ -1207,14 +1335,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.electionDebug = true
-	rf.logReplicationDebug = true
-	rf.persistenceDebug = true
-	rf.snapshotDebug = true
-	//rf.electionDebug = false
-	//rf.logReplicationDebug = false
-	//rf.persistenceDebug = false
-	//rf.snapshotDebug = false
+	//rf.electionDebug = true
+	//rf.logReplicationDebug = true
+	//rf.persistenceDebug = true
+	//rf.snapshotDebug = true
+	rf.electionDebug = false
+	rf.logReplicationDebug = false
+	rf.persistenceDebug = false
+	rf.snapshotDebug = false
 	rf.raftState = MakeRaftState(rf)
 	// log[0] is unused, just to start at 1.
 	rf.log = make([]LogEntry, 1)
