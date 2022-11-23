@@ -815,6 +815,23 @@ func (rf *Raft) sendAppendEntries(to int, args *AppendEntriesArgs, reply *Append
 					log.Fatalf("ERROR: NextRetryStartIndex is 0!!\n")
 				}
 				// TODO: 如果 reply.reply.NextRetryStartIndex 已经被包含进快照里，没有实际 log 了，那么把快照发给 follower
+				rf.logMutex.RLock()
+				if reply.NextRetryStartIndex <= rf.lastIncludedIndex {
+					go rf.sendInstallSnapshot(to,
+						&InstallSnapshotArgs{
+							rf.raftState.currentTerm,
+							rf.me,
+							rf.lastIncludedIndex,
+							rf.lastIncludedTerm,
+							rf.persister.ReadSnapshot(),
+						},
+						&InstallSnapshotReply{})
+					rf.logMutex.RUnlock()
+					rf.peerLogMutex.Unlock()
+					rf.raftState.wUnlock()
+					return
+				}
+				rf.logMutex.RUnlock()
 				rf.nextIndex[to] = reply.NextRetryStartIndex
 				// 这里的重发并不使用最新的 term 和 leader commit，而是保持原请求的值，只更新prev、entries
 				// 将 PrevLogIndex 直接和 nextIndex 绑定而不是简单递减，避免多个 append to all 并发时出现问题
