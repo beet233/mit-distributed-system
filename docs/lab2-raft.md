@@ -813,8 +813,89 @@ if rf.lastIncludedIndex > args.PrevLogIndex {
 }
 ```
 
-## Backup
+#### Never Go Backward
+
+在 `InstallSnapshot` 中，我们也需要注意，如果发来的快照比手头已经提交的日志 `rf.lastApplied` 还要旧（这在并发度比较高的时候完全可能发生），那显然是不要执行 `install` 的。在安装了 `leader` 发来的快照后，显然我们也需要更新一下 `lastIncludedIndex`，`lastIncludedTerm`，`lastApplied`，`commitIndex` 等等。
+
+#### Share applyCh with Common logs
+
+我们同样使用 `applyCh` 来把快照数据传给状态机。结构体中区分了快照和普通的日志：
+
+```go
+type ApplyMsg struct {
+	CommandValid bool
+	Command      interface{}
+	CommandIndex int
+
+	// For 2D:
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotTerm  int
+	SnapshotIndex int
+}
+```
+
+#### Keep consistent without waiting for next log
+
+在发现某个 follower 落后太多，发给他 `snapshot` 后，任务还没结束，还需要继续让那个 follower 更新到最新的 log 才行。于是在 `sendSnapshot` 中递归地发送更新，如果 send 完 snapshot 后又太落后了，那就继续发新的 snapshot，如果进度就差一些，那把后缀的几个 log 通过 `sendAppendEntries` 发过去。
+
+#### Better the code structure
+
+我原本写的结构是：在一个 `sendAppendEntriesToAll` 函数中，并发地调用各个 server 的 RPC 后，各个线程都把结果传回一个 channel，在 `sendAppendEntriesToAll` 中弄一个循环来读取这个 channel，依次处理返回值。然鹅，当出现了发送快照这个不一样的需求后，channel 的参数类型又不得不进行进一步的包装，十分恶心。于是，还是把失败重试的处理和成功结果的处理也都放进了并发 go 出去调用 RPC 的线程中，这样也免除了在单一 channel 中分辨是哪个 server 的返回的麻烦。
+
+```go
+func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
+   rf.peerLogMutex.Lock()
+   rf.logMutex.RLock()
+   for i := 0; i < len(rf.peers); i++ {
+      if i == rf.me {
+         continue
+      }
+      rf.logReplicationLog("nextIndex[%d] = %d\n", i, rf.nextIndex[i])
+      if rf.getLogLength()-1 >= rf.nextIndex[i] {
+         prevLogIndex := rf.nextIndex[i] - 1
+         if rf.lastIncludedIndex > prevLogIndex {
+            go rf.sendInstallSnapshot(i,
+               &InstallSnapshotArgs{
+                  thisTerm,
+                  rf.me,
+                  rf.lastIncludedIndex,
+                  rf.lastIncludedTerm,
+                  rf.persister.ReadSnapshot(),
+               },
+               &InstallSnapshotReply{})
+            continue
+         }
+         prevLogTerm := rf.getTermOfLog(prevLogIndex)
+         rf.commitMutex.RLock()
+         args := AppendEntriesArgs{
+            thisTerm,
+            rf.me,
+            rf.getLogsFrom(rf.nextIndex[i]),
+            prevLogIndex,
+            prevLogTerm,
+            rf.commitIndex,
+         }
+         rf.commitMutex.RUnlock()
+         var reply AppendEntriesReply
+         go rf.sendAppendEntries(i, &args, &reply)
+      }
+   }
+   rf.logMutex.RUnlock()
+   rf.peerLogMutex.Unlock()
+}
+```
+
+## TIPS
 
 ### Lock Order
 
 `rf.raftState` -> `rf.peerLogMutex` -> `rf.logMutex` -> `rf.commitMutex` -> `rf.leaderInitMutex`
+
+### Some Pities
+
+这个 lab 2 Raft 做到最后还是留下了遗憾：它并不是那么稳定地通过测试，而是会发生死锁——主要是在关闭打印日志的时候发生。在打开打印日志时，死锁便变得罕见了，看起来有些离奇。我在完成后阅读了其他人的实现，发现大部分稳定的代码都是用了框架本身提供的 mu 那唯一一把互斥锁，而不是像我一样使用非常复杂的四五把读写锁来完成整个流程。
+
+我确信我的代码严格地按照 `Lock Order` 来进行五把锁的顺序上锁，然而死锁并没能被完全避免，并且有些时候看起来并不是彻底的死锁，而是发生了饥饿，我在 `go-deadlock` 的报错中看到了许多次这样的情况——锁的持有者完全不具备长期持有锁的可能。我了解到读写锁中，读锁的并发持有可能让写锁陷入饥饿。我也了解到当一个 golang 中的读写锁正被读锁，并有写锁在排队时，其他的读锁无法继续加上去等等。在 6.824 前，我对 golang 一无所知。
+
+如果来日对读写锁以及死锁避免有了更多的理解，也许会回来再思考思考。

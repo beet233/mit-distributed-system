@@ -914,7 +914,14 @@ func (rf *Raft) sendInstallSnapshot(to int, args *InstallSnapshotArgs, reply *In
 			}
 			prevLogTerm := rf.getTermOfLog(prevLogIndex)
 			rf.commitMutex.RLock()
-			appendArgs := AppendEntriesArgs{args.Term, rf.me, rf.getLogsFrom(rf.nextIndex[to]), prevLogIndex, prevLogTerm, rf.commitIndex}
+			appendArgs := AppendEntriesArgs{
+				args.Term,
+				rf.me,
+				rf.getLogsFrom(rf.nextIndex[to]),
+				prevLogIndex,
+				prevLogTerm,
+				rf.commitIndex,
+			}
 			var appendReply AppendEntriesReply
 			go rf.sendAppendEntries(to, &appendArgs, &appendReply)
 			rf.commitMutex.RUnlock()
@@ -1074,7 +1081,14 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 			}
 			prevLogTerm := rf.getTermOfLog(prevLogIndex)
 			rf.commitMutex.RLock()
-			args := AppendEntriesArgs{thisTerm, rf.me, rf.getLogsFrom(rf.nextIndex[i]), prevLogIndex, prevLogTerm, rf.commitIndex}
+			args := AppendEntriesArgs{
+				thisTerm,
+				rf.me,
+				rf.getLogsFrom(rf.nextIndex[i]),
+				prevLogIndex,
+				prevLogTerm,
+				rf.commitIndex,
+			}
 			rf.commitMutex.RUnlock()
 			var reply AppendEntriesReply
 			//go rf.sendAppendEntriesWithChannelReply(i, &args, &reply, replyChannel)
