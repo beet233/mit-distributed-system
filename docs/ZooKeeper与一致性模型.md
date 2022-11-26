@@ -232,6 +232,18 @@ Follower/Observer 均可接受写请求，但不能直接处理，而需要将�
 - 完成同步后通知 follower 已经成为 uptodate 状态；
 - Follower 收到 uptodate 消息后，又可以重新接受 client 的请求进行服务了。
 
+### 客户端 API
+
+下面给出了 ZooKeeper API 的一个子集，并讨论每个请求的语义。
+
+- **create(path, data, flags)**：使用 path 名称创建一个 znode 节点，保存 data，返回新创建的 znode 名称。 flags 用于创建普通或者临时节点，也可以设置顺序标识。
+- **delete(path, version)**： 删除指定 path 和 version 的 znode 节点。
+- **exists(path, watch)**： 如果指定 path 的 znode 存在则返回真，如果不存在则返回假。watch 标识用于在 znode 上设置监视器。
+- **getData(path, watch)**： 返回数据和元数据，如版本信息。watch 标识与 `exists()` 的 watch 标识一样，但如果 znode 不存在则不会设置监视器。
+- **setData(path, data, version)**： 根据 path 和 version 将数据写入到 znode。
+- **getChildren(path, watch)**： 返回 znode 所有子节点的名称集合。
+- **sync(path)**： 在操作开始时，等待所有挂起的更新操作发送到客户端连接的服务器。path 当前未使用。
+
 ### Watch
 
 **客户端注册监听它关心的 znode，当 znode 状态发生变化（数据变化、子节点增减变化）时，ZooKeeper 服务会通知客户端。**
