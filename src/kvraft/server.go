@@ -23,6 +23,12 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type WaitChResponse struct {
+	op    Op
+	err   Err
+	value string // for Get
+}
+
 const (
 	GET    = 0
 	PUT    = 1
@@ -54,7 +60,7 @@ type KVServer struct {
 	// Your definitions here.
 	storage map[string]string
 	// raft log index -> wait channel
-	waitChs map[int]chan Op
+	waitChs map[int]chan WaitChResponse
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -78,23 +84,17 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			if exist {
 				log.Fatalf("kv | server %d try to get a existing waitCh\n", kv.me)
 			}
-			kv.waitChs[raftIndex] = make(chan Op, 1)
+			kv.waitChs[raftIndex] = make(chan WaitChResponse, 1)
 			waitCh = kv.waitChs[raftIndex]
 			kv.mu.Unlock()
 			// 选择在 server 端来判断超时，如果超时了还没返回，共识失败，认为 ErrWrongLeader
 			select {
 			case <-time.After(time.Millisecond * TimeOut):
+				DPrintf("server %d timeout when handling Get\n", kv.me)
 				reply.Err = ErrWrongLeader
-			case committedOp := <-waitCh:
-				kv.mu.Lock()
-				value, keyExist := kv.storage[committedOp.Key]
-				kv.mu.Unlock()
-				if !keyExist {
-					reply.Err = ErrNoKey
-				} else {
-					reply.Err = OK
-					reply.Value = value
-				}
+			case response := <-waitCh:
+				reply.Value = response.value
+				reply.Err = response.err
 			}
 			// 用完后把 waitCh 删掉
 			kv.mu.Lock()
@@ -127,23 +127,16 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			if exist {
 				log.Fatalf("kv | server %d try to get a existing waitCh\n", kv.me)
 			}
-			kv.waitChs[raftIndex] = make(chan Op, 1)
+			kv.waitChs[raftIndex] = make(chan WaitChResponse, 1)
 			waitCh = kv.waitChs[raftIndex]
 			kv.mu.Unlock()
 			// 选择在 server 端来判断超时，如果超时了还没返回，共识失败，认为 ErrWrongLeader
 			select {
 			case <-time.After(time.Millisecond * TimeOut):
+				DPrintf("server %d timeout when handling PutAppend\n", kv.me)
 				reply.Err = ErrWrongLeader
-			case committedOp := <-waitCh:
-				kv.mu.Lock()
-				value, keyExist := kv.storage[committedOp.Key]
-				if committedOp.Type == APPEND && keyExist {
-					kv.storage[committedOp.Key] = value + committedOp.Value
-				} else {
-					kv.storage[committedOp.Key] = committedOp.Value
-				}
-				kv.mu.Unlock()
-				reply.Err = OK
+			case response := <-waitCh:
+				reply.Err = response.err
 			}
 			// 用完后把 waitCh 删掉
 			kv.mu.Lock()
@@ -179,11 +172,43 @@ func (kv *KVServer) applyLoop() {
 	for {
 		applyMsg := <-kv.applyCh
 		if applyMsg.CommandValid {
-			// 如果返回了，却找不到这个 waitCh 了，那说明超时被放弃了，直接丢掉就行
+			op := applyMsg.Command.(Op)
+			waitChResponse := WaitChResponse{op: op}
+			switch op.Type {
+			case GET:
+				kv.mu.Lock()
+				value, keyExist := kv.storage[applyMsg.Command.(Op).Key]
+				kv.mu.Unlock()
+				if !keyExist {
+					waitChResponse.err = ErrNoKey
+				} else {
+					waitChResponse.err = OK
+					waitChResponse.value = value
+				}
+			case PUT:
+				kv.mu.Lock()
+				kv.storage[op.Key] = op.Value
+				kv.mu.Unlock()
+				waitChResponse.err = OK
+			case APPEND:
+				kv.mu.Lock()
+				value, keyExist := kv.storage[op.Key]
+				if keyExist {
+					kv.storage[op.Key] = value + op.Value
+				} else {
+					kv.storage[op.Key] = op.Value
+				}
+				kv.mu.Unlock()
+				waitChResponse.err = OK
+			}
+			// 如果返回了，却找不到这个 waitCh 了，那说明超时被放弃了，直接不传就行，下次遇到同样的就不执行
 			waitCh, exist := kv.waitChs[applyMsg.CommandIndex]
-			DPrintf("server %d found waitCh deleted\n", kv.me)
+			// 注意，其实只有 leader 有 waitCh，别的 follower 虽然也不断从 applyCh 里接收，但是是没有 waitCh 的
+			// 同理，follower 们的 apply 到 storage 的过程实质上要在 applyLoop 进行
 			if exist {
-				waitCh <- applyMsg.Command.(Op)
+				waitCh <- waitChResponse
+			} else {
+				DPrintf("server %d found no waitCh for raftIndex %d\n", kv.me, applyMsg.CommandIndex)
 			}
 		}
 	}
@@ -220,6 +245,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	kv.storage = make(map[string]string)
+	kv.waitChs = make(map[int]chan WaitChResponse)
 	go kv.applyLoop()
 	return kv
 }
