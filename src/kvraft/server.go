@@ -4,25 +4,42 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
 
+const TimeOut = 500
+
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
-		log.Printf(format, a...)
+		rightHalf := fmt.Sprintf(format, a...)
+		log.Printf("kv | %s", rightHalf)
 	}
 	return
 }
 
+const (
+	GET    = 0
+	PUT    = 1
+	APPEND = 2
+)
+
+type OpType int
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type      OpType
+	Key       string
+	Value     string
+	ClientId  int64
+	RequestId int
 }
 
 type KVServer struct {
@@ -35,15 +52,67 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	storage map[string]string
+	// raft log index -> wait channel
+	waitChs map[int]chan Op
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	// 如果我背后的 raft replica 并不是 leader，那直接返回一个 Err
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+	} else {
+		// 把这次请求打包成一个 Op 发给 raft 的 Start
+		// 解释一下为什么不直接返回 storage 的内容而是要把 get 也发给 raft 做共识：
+		// 因为我们要保证线性一致性，所以把 get 发给 raft，等收到这次的 applyMsg 后，
+		// 可以保证之前的所有命令都已经执行。
+		raftIndex, _, isLeader := kv.rf.Start(Op{Type: GET, Key: args.Key, ClientId: args.ClientId, RequestId: args.RequestId})
+		if !isLeader {
+			reply.Err = ErrWrongLeader
+		} else {
+			// 因为这个 Get 是个 RPC Handler，是要返回 reply 的，所以要等到 applyCh 传回关于这条指令的 msg 才行，建立以下通信机制
+			kv.mu.Lock()
+			waitCh, exist := kv.waitChs[raftIndex]
+			if exist {
+				log.Fatalf("kv | server %d try to get a existing waitCh\n", kv.me)
+			}
+			kv.waitChs[raftIndex] = make(chan Op, 1)
+			waitCh = kv.waitChs[raftIndex]
+			kv.mu.Unlock()
+			// 选择在 server 端来判断超时，如果超时了还没返回，共识失败，认为 ErrWrongLeader
+			select {
+			case <-time.After(time.Millisecond * TimeOut):
+				reply.Err = ErrWrongLeader
+			case committedOp := <-waitCh:
+				kv.mu.Lock()
+				value, keyExist := kv.storage[committedOp.Key]
+				kv.mu.Unlock()
+				if !keyExist {
+					reply.Err = ErrNoKey
+				} else {
+					reply.Err = OK
+					reply.Value = value
+				}
+			}
+			// 用完后把 waitCh 删掉
+			kv.mu.Lock()
+			delete(kv.waitChs, raftIndex)
+			kv.mu.Unlock()
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	// 如果我背后的 raft replica 并不是 leader，那直接返回一个 Err
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+	} else {
+		// 把这次请求打包成一个 Op 发给 raft 的 Start
+	}
 }
 
 //
@@ -65,6 +134,21 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+// 负责接收 applyCh 并分发给各个 rpc handler 线程
+func (kv *KVServer) applyLoop() {
+	for {
+		applyMsg := <-kv.applyCh
+		if applyMsg.CommandValid {
+			// 如果返回了，却找不到这个 waitCh 了，那说明超时被放弃了，直接丢掉就行
+			waitCh, exist := kv.waitChs[applyMsg.CommandIndex]
+			log.Printf("kv | server %d found waitCh deleted\n", kv.me)
+			if exist {
+				waitCh <- applyMsg.Command.(Op)
+			}
+		}
+	}
 }
 
 //
@@ -97,5 +181,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
+	kv.storage = make(map[string]string)
+	go kv.applyLoop()
 	return kv
 }
