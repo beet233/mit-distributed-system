@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const Debug = false
+const Debug = true
 
 const TimeOut = 500
 
@@ -112,6 +112,44 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 	} else {
 		// 把这次请求打包成一个 Op 发给 raft 的 Start
+		var opType OpType
+		if args.Op == "Put" {
+			opType = PUT
+		} else {
+			opType = APPEND
+		}
+		raftIndex, _, isLeader := kv.rf.Start(Op{Type: opType, Key: args.Key, Value: args.Value, ClientId: args.ClientId, RequestId: args.RequestId})
+		if !isLeader {
+			reply.Err = ErrWrongLeader
+		} else {
+			kv.mu.Lock()
+			waitCh, exist := kv.waitChs[raftIndex]
+			if exist {
+				log.Fatalf("kv | server %d try to get a existing waitCh\n", kv.me)
+			}
+			kv.waitChs[raftIndex] = make(chan Op, 1)
+			waitCh = kv.waitChs[raftIndex]
+			kv.mu.Unlock()
+			// 选择在 server 端来判断超时，如果超时了还没返回，共识失败，认为 ErrWrongLeader
+			select {
+			case <-time.After(time.Millisecond * TimeOut):
+				reply.Err = ErrWrongLeader
+			case committedOp := <-waitCh:
+				kv.mu.Lock()
+				value, keyExist := kv.storage[committedOp.Key]
+				if committedOp.Type == APPEND && keyExist {
+					kv.storage[committedOp.Key] = value + committedOp.Value
+				} else {
+					kv.storage[committedOp.Key] = committedOp.Value
+				}
+				kv.mu.Unlock()
+				reply.Err = OK
+			}
+			// 用完后把 waitCh 删掉
+			kv.mu.Lock()
+			delete(kv.waitChs, raftIndex)
+			kv.mu.Unlock()
+		}
 	}
 }
 
@@ -143,7 +181,7 @@ func (kv *KVServer) applyLoop() {
 		if applyMsg.CommandValid {
 			// 如果返回了，却找不到这个 waitCh 了，那说明超时被放弃了，直接丢掉就行
 			waitCh, exist := kv.waitChs[applyMsg.CommandIndex]
-			log.Printf("kv | server %d found waitCh deleted\n", kv.me)
+			DPrintf("server %d found waitCh deleted\n", kv.me)
 			if exist {
 				waitCh <- applyMsg.Command.(Op)
 			}
