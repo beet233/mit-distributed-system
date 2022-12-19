@@ -899,3 +899,13 @@ func (rf *Raft) sendAppendEntriesToAll(thisTerm int) {
 我确信我的代码严格地按照 `Lock Order` 来进行五把锁的顺序上锁，然而死锁并没能被完全避免，并且有些时候看起来并不是彻底的死锁，而是发生了饥饿，我在 `go-deadlock` 的报错中看到了许多次这样的情况——锁的持有者完全不具备长期持有锁的可能。我了解到读写锁中，读锁的并发持有可能让写锁陷入饥饿。我也了解到当一个 golang 中的读写锁正被读锁，并有写锁在排队时，其他的读锁无法继续加上去等等。在 6.824 前，我对 golang 一无所知。
 
 如果来日对读写锁以及死锁避免有了更多的理解，也许会回来再思考思考。
+
+> 时隔一个月，我在看到一篇文章描述了略有类似的问题后，突然发觉了我的错误，真是不可思议）。
+>
+> 我是用一个 `tryIncrementCommitIndex` 函数来让 `leader` 的 commitIndex 增加的，因为 leader 需要在检查到所有 follower 都收到了一条 log 后，才 commit 它。我原先的处理是，每次收到 AppendEntires 的 RPC reply 时，如果发现某个 follower 更新了日志，那就 go 一个 tryIncrementCommitIndex。
+>
+> 然后的情况就是，tryIncrementCommitIndex 总是会占用某把锁长达 30s 而触发 deadlock 监测。我也说了，我怎么也没找到死锁发生的可能。现在看来，是 tryIncrementCommitIndex 线程数太多，把整个锁资源挤爆了，导致其他线程的饥饿。
+>
+> 原因清楚了之后，解决起来就很简单：tryIncrementCommitIndex 太多了，那就干脆只启动一个线程，当 leader 初始化完毕后，`go rf.tryIncrementCommitIndex` ，保持循环，每次循环 sleep 一段时间（我最后设置成 20ms），再不断检测 commitIndex 是不是可以增加了。如果不是 leader 了，退出循环。新 leader 会启动这个函数。当 leader 的 commitIndex 增加后，通过心跳或真正的 AppendEntries，follower 们也会很快增加 commitIndex。
+>
+> 中间还有一个小插曲，那就是 applyNotifyCh 也爆满了，导致阻塞），可能 tryIncrementCommitIndex 的节奏不太好把握。我索性把 applyNotifyCh 的 buffer 从 10 调到了 500，死锁的问题被彻底解决了。
