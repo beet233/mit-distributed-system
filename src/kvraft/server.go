@@ -60,7 +60,8 @@ type KVServer struct {
 	// Your definitions here.
 	storage map[string]string
 	// raft log index -> wait channel
-	waitChs map[int]chan WaitChResponse
+	waitChs              map[int]chan WaitChResponse
+	latestAppliedRequest map[int64]int // clientId -> requestId
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -174,9 +175,20 @@ func (kv *KVServer) applyLoop() {
 		if applyMsg.CommandValid {
 			op := applyMsg.Command.(Op)
 			waitChResponse := WaitChResponse{op: op}
+			// 需要注意处理重复的请求
 			switch op.Type {
 			case GET:
 				kv.mu.Lock()
+				// 对于读请求，要保证线性一致性，其实只要共识达成了就行，保证（在读请求发出前就完成的操作都被读到）
+				// 在读请求返回前，如果因为发生了问题而间隔较长，返回的内容其实是灵活的，在满足线性一致性的前提下取决于实现
+				// 我感觉读请求不需要做额外处理，如果是一次重试，那还是直接读现在的
+				_, exist := kv.latestAppliedRequest[op.ClientId]
+				if !exist {
+					kv.latestAppliedRequest[op.ClientId] = -1
+				}
+				if op.RequestId > kv.latestAppliedRequest[op.ClientId] {
+					kv.latestAppliedRequest[op.ClientId] = op.RequestId
+				}
 				value, keyExist := kv.storage[applyMsg.Command.(Op).Key]
 				kv.mu.Unlock()
 				if !keyExist {
@@ -187,17 +199,33 @@ func (kv *KVServer) applyLoop() {
 				}
 			case PUT:
 				kv.mu.Lock()
-				kv.storage[op.Key] = op.Value
+				_, exist := kv.latestAppliedRequest[op.ClientId]
+				if !exist {
+					kv.latestAppliedRequest[op.ClientId] = -1
+				}
+				if op.RequestId > kv.latestAppliedRequest[op.ClientId] {
+					kv.latestAppliedRequest[op.ClientId] = op.RequestId
+					kv.storage[op.Key] = op.Value
+				}
+				// 如果是重复的请求，就不做实际操作了，返回 OK 就行
 				kv.mu.Unlock()
 				waitChResponse.err = OK
 			case APPEND:
 				kv.mu.Lock()
-				value, keyExist := kv.storage[op.Key]
-				if keyExist {
-					kv.storage[op.Key] = value + op.Value
-				} else {
-					kv.storage[op.Key] = op.Value
+				_, exist := kv.latestAppliedRequest[op.ClientId]
+				if !exist {
+					kv.latestAppliedRequest[op.ClientId] = -1
 				}
+				if op.RequestId > kv.latestAppliedRequest[op.ClientId] {
+					kv.latestAppliedRequest[op.ClientId] = op.RequestId
+					value, keyExist := kv.storage[op.Key]
+					if keyExist {
+						kv.storage[op.Key] = value + op.Value
+					} else {
+						kv.storage[op.Key] = op.Value
+					}
+				}
+				// 如果是重复的请求，就不做实际操作了，返回 OK 就行
 				kv.mu.Unlock()
 				waitChResponse.err = OK
 			}
@@ -246,6 +274,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.storage = make(map[string]string)
 	kv.waitChs = make(map[int]chan WaitChResponse)
+	kv.latestAppliedRequest = make(map[int64]int)
 	go kv.applyLoop()
 	return kv
 }

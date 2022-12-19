@@ -64,7 +64,6 @@ func (ck *Clerk) Get(key string) string {
 		args := GetArgs{Key: key, ClientId: ck.clientId, RequestId: ck.requestId}
 		reply := GetReply{}
 		ok := ck.servers[ck.lastLeader].Call("KVServer.Get", &args, &reply)
-		// TODO: 疑问，网络错误的话，我应该重试还是去试试下一个 server，目前这样是直接下一个
 		if ok {
 			if reply.Err == OK {
 				result = reply.Value
@@ -99,7 +98,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		args := PutAppendArgs{Key: key, Value: value, Op: op, ClientId: ck.clientId, RequestId: ck.requestId}
 		reply := PutAppendReply{}
 		ok := ck.servers[ck.lastLeader].Call("KVServer.PutAppend", &args, &reply)
-		// TODO: 疑问，网络错误的话，我应该重试还是去试试下一个 server，目前这样是直接下一个
+		// 网络错误的话，直接下一个，这个 leader 可能已经挂了
 		if ok {
 			if reply.Err == OK {
 				break

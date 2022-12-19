@@ -3,5 +3,6 @@ api.key
 .api.key.trimmed
 *-handin.tar.gz
 src/raft/*.txt
+src/kvraft/*.txt
 log*
 .idea/*
