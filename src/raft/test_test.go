@@ -978,9 +978,6 @@ func TestFigure8Unreliable2C(t *testing.T) {
 	}
 	randCommand := rand.Int() % 10000
 	cfg.t.Logf("final randCommand: %v", randCommand)
-	for i := 0; i < servers; i++ {
-		cfg.t.Logf("server %v 's log: %v", i, cfg.rafts[i].log)
-	}
 	cfg.one(randCommand, servers, true)
 
 	cfg.end()
