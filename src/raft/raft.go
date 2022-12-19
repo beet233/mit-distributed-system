@@ -805,7 +805,7 @@ func (rf *Raft) sendAppendEntries(to int, args *AppendEntriesArgs, reply *Append
 					rf.logReplicationLog("server %d 's nextIndex update to %d\n", to, rf.nextIndex[to])
 				}
 				// 每有成功的 AppendEntries 返回时，就尝试一下 commit 以及 apply
-				go rf.tryIncrementCommitIndex()
+				//go rf.tryIncrementCommitIndex()
 				rf.peerLogMutex.Unlock()
 				rf.raftState.wUnlock()
 				return
@@ -997,7 +997,7 @@ func (rf *Raft) sendHeartbeatToAll(thisTerm int) {
 					rf.logReplicationLog("server %d 's matchIndex update to %d\n", reply.from, rf.matchIndex[reply.from])
 					rf.logReplicationLog("server %d 's nextIndex update to %d\n", reply.from, rf.nextIndex[reply.from])
 					// 更新 nextIndex 和 matchIndex 成功，尝试一下 commit 以及 apply
-					go rf.tryIncrementCommitIndex()
+					//go rf.tryIncrementCommitIndex()
 				}
 			}
 			rf.peerLogMutex.Unlock()
@@ -1006,49 +1006,56 @@ func (rf *Raft) sendHeartbeatToAll(thisTerm int) {
 	}
 }
 
-// TODO: 经常有 potential deadlock 和这里有关, 但这里的上锁顺序似乎没什么大毛病
+// TODO: 经常有 potential deadlock 和这里有关, 但这里的上锁顺序似乎没什么大毛病，感觉是启动过多的毛病
 // only for leader，followers' commitIndex is updated by AppendEntries.
 func (rf *Raft) tryIncrementCommitIndex() {
-	rf.logReplicationLog("try increment commit index\n")
-	rf.raftState.rLock()
-	rf.logMutex.RLock()
-	rf.commitMutex.RLock()
-	thisLogLength := rf.getLogLength()
-	thisTerm := rf.raftState.currentTerm
-	thisCommitIndex := rf.commitIndex
-	rf.commitMutex.RUnlock()
-	rf.logMutex.RUnlock()
-	rf.raftState.rUnlock()
-	rf.logReplicationLog("try increment commit release lock\n")
-	for i := thisCommitIndex + 1; i < thisLogLength; i++ {
+	for {
+		time.Sleep(20 * time.Millisecond)
+		rf.raftState.rLock()
+		if !rf.raftState.isState(leaderState) {
+			rf.raftState.rUnlock()
+			break
+		}
+		rf.logReplicationLog("try increment commit index\n")
 		rf.logMutex.RLock()
 		rf.commitMutex.RLock()
-		if i <= rf.lastIncludedIndex {
-			i = rf.lastIncludedIndex
-			rf.commitMutex.RUnlock()
-			rf.logMutex.RUnlock()
-			continue
-		}
-		nowLogTerm := rf.getTermOfLog(i)
+		thisLogLength := rf.getLogLength()
+		thisTerm := rf.raftState.currentTerm
+		thisCommitIndex := rf.commitIndex
 		rf.commitMutex.RUnlock()
 		rf.logMutex.RUnlock()
-		if nowLogTerm == thisTerm {
-			count := 0
-			rf.peerLogMutex.RLock()
-			for j := 0; j < len(rf.peers); j++ {
-				if rf.matchIndex[j] >= i {
-					count += 1
+		rf.raftState.rUnlock()
+		rf.logReplicationLog("try increment commit release lock\n")
+		for i := thisCommitIndex + 1; i < thisLogLength; i++ {
+			rf.logMutex.RLock()
+			rf.commitMutex.RLock()
+			if i <= rf.lastIncludedIndex {
+				i = rf.lastIncludedIndex
+				rf.commitMutex.RUnlock()
+				rf.logMutex.RUnlock()
+				continue
+			}
+			nowLogTerm := rf.getTermOfLog(i)
+			rf.commitMutex.RUnlock()
+			rf.logMutex.RUnlock()
+			if nowLogTerm == thisTerm {
+				count := 0
+				rf.peerLogMutex.RLock()
+				for j := 0; j < len(rf.peers); j++ {
+					if rf.matchIndex[j] >= i {
+						count += 1
+					}
 				}
+				rf.peerLogMutex.RUnlock()
+				rf.commitMutex.Lock()
+				if count > len(rf.peers)/2 && i > rf.commitIndex {
+					rf.commitIndex = i
+					rf.logReplicationLog("most servers has the log %d, input 0 into applyNotifyCh\n", i)
+					rf.applyNotifyCh <- 0
+					rf.logReplicationLog("notify success\n")
+				}
+				rf.commitMutex.Unlock()
 			}
-			rf.peerLogMutex.RUnlock()
-			rf.commitMutex.Lock()
-			if count > len(rf.peers)/2 && i > rf.commitIndex {
-				rf.commitIndex = i
-				rf.logReplicationLog("most servers has the log %d, input 0 into applyNotifyCh\n", i)
-				rf.applyNotifyCh <- 0
-				rf.logReplicationLog("notify success\n")
-			}
-			rf.commitMutex.Unlock()
 		}
 	}
 }
@@ -1199,6 +1206,7 @@ func (rf *Raft) leaderMain() {
 	rf.leaderInitDone = true
 	rf.leaderInitMutex.Unlock()
 	rf.logReplicationLog("leader init done\n")
+	go rf.tryIncrementCommitIndex()
 	// 每 40 ms 发送一轮 heartbeat
 	for {
 		// send heartbeat to all servers
@@ -1416,14 +1424,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.electionDebug = true
-	rf.logReplicationDebug = true
-	rf.persistenceDebug = true
-	rf.snapshotDebug = true
-	//rf.electionDebug = false
-	//rf.logReplicationDebug = false
-	//rf.persistenceDebug = false
-	//rf.snapshotDebug = false
+	//rf.electionDebug = true
+	//rf.logReplicationDebug = true
+	//rf.persistenceDebug = true
+	//rf.snapshotDebug = true
+	rf.electionDebug = false
+	rf.logReplicationDebug = false
+	rf.persistenceDebug = false
+	rf.snapshotDebug = false
 	rf.raftState = MakeRaftState(rf)
 	// log[0] is unused, just to start at 1.
 	rf.log = make([]LogEntry, 1)
@@ -1437,7 +1445,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
 	rf.leaderInitDone = false
-	rf.applyNotifyCh = make(chan int, 10)
+	rf.applyNotifyCh = make(chan int, 500)
 
 	// initialize from state persisted before a crash
 	rf.persistenceLog("remake and readPersist\n")

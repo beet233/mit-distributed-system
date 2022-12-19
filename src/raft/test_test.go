@@ -839,7 +839,6 @@ func TestPersist32C(t *testing.T) {
 // The leader in a new Term may try to finish replicating log Entries that
 // haven't been committed yet.
 //
-// TODO: 这个的报错那次非常神秘，完全不应该有死锁，但是就是没释放掉，怀疑是 leaderInitDone 之类的变量没上锁导致的偶发 race 之类的
 func TestFigure82C(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false, false)
