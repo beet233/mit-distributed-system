@@ -1,6 +1,9 @@
 package kvraft
 
-import "6.824/porcupine"
+import (
+	"6.824/porcupine"
+	"log"
+)
 import "6.824/models"
 import "testing"
 import "strconv"
@@ -487,6 +490,7 @@ func TestOnePartition3A(t *testing.T) {
 	cfg.begin("Test: progress in majority (3A)")
 
 	p1, p2 := cfg.make_partition()
+	log.Printf("p1: %v, p2: %v\n", p1, p2)
 	cfg.partition(p1, p2)
 
 	ckp1 := cfg.makeClient(p1)  // connect ckp1 to p1

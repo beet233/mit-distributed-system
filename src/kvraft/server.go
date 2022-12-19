@@ -13,7 +13,9 @@ import (
 
 const Debug = true
 
-const TimeOut = 500
+// 因为有部分测试如 TestOnePartition3A 会在一定时间内就去检查结果
+// 如果重试得太慢，就会 fail，而重试快一些也无所谓，有防止 duplicated 机制
+const TimeOut = 200
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -112,6 +114,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 	} else {
+		DPrintf("server %d handle PutAppend key: %s, value: %s\n", kv.me, args.Key, args.Value)
 		// 把这次请求打包成一个 Op 发给 raft 的 Start
 		var opType OpType
 		if args.Op == "Put" {
@@ -199,6 +202,7 @@ func (kv *KVServer) applyLoop() {
 				}
 			case PUT:
 				kv.mu.Lock()
+				DPrintf("server %d put key: %s, value: %s\n", kv.me, op.Key, op.Value)
 				_, exist := kv.latestAppliedRequest[op.ClientId]
 				if !exist {
 					kv.latestAppliedRequest[op.ClientId] = -1
@@ -212,6 +216,7 @@ func (kv *KVServer) applyLoop() {
 				waitChResponse.err = OK
 			case APPEND:
 				kv.mu.Lock()
+				DPrintf("server %d append key: %s, value: %s\n", kv.me, op.Key, op.Value)
 				_, exist := kv.latestAppliedRequest[op.ClientId]
 				if !exist {
 					kv.latestAppliedRequest[op.ClientId] = -1
@@ -230,13 +235,15 @@ func (kv *KVServer) applyLoop() {
 				waitChResponse.err = OK
 			}
 			// 如果返回了，却找不到这个 waitCh 了，那说明超时被放弃了，直接不传就行，下次遇到同样的就不执行
+			kv.mu.Lock()
 			waitCh, exist := kv.waitChs[applyMsg.CommandIndex]
+			kv.mu.Unlock()
 			// 注意，其实只有 leader 有 waitCh，别的 follower 虽然也不断从 applyCh 里接收，但是是没有 waitCh 的
 			// 同理，follower 们的 apply 到 storage 的过程实质上要在 applyLoop 进行
 			if exist {
 				waitCh <- waitChResponse
 			} else {
-				DPrintf("server %d found no waitCh for raftIndex %d\n", kv.me, applyMsg.CommandIndex)
+				//DPrintf("server %d found no waitCh for raftIndex %d\n", kv.me, applyMsg.CommandIndex)
 			}
 		}
 	}
