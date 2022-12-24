@@ -11,10 +11,9 @@ Based on [mit-6.824]([6.824 Schedule: Spring 2022 (mit.edu)](https://pdos.csail.
   - [x] Part 2C - persistence
   - [x] Part 2D - log compaction
 
-- [ ] Lab 3 - KV Raft([doc](./docs/lab3-kvraft.md))
- 
-  - [x] Part 3A - Key/value service without snapshots
-  - [ ] Part 3B - Key/value service with snapshots
-  
+- [x] Lab 3 - KV Raft([doc](./docs/lab3-kvraft.md))
 
+  - [x] Part 3A - Key/value service without snapshots
+  - [x] Part 3B - Key/value service with snapshots
+  
 - [ ] Lab 4 - Sharded KV

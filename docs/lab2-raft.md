@@ -726,11 +726,11 @@ Copy on Write 指借用 Linux 的 fork，直接先上锁暂停，fork 一个一�
   func (rf *Raft) Snapshot(index int, snapshot []byte)
   ```
 
-  由 Service 层来调用 rf.Snapshot，让该 server 用快照来替换前面的日志。index 为快照包含的最新 Log index，snapshot 为快照的字节流。那么 Service 层从哪搞来快照呢？答案就是在 Service 层自己实现，不用 raft 这边管。
+  由 Service 层来调用 rf.Snapshot，让该 server 用快照来替换前面的日志。index 为快照包含的最新 Log index，snapshot 为 service 层（如 kvraft）快照的字节流。
 
   ![img](https://beetpic.oss-cn-hangzhou.aliyuncs.com/img/202210312152598.jpeg)
   
-  注意一下，snapshot 里是包含最后一条 Log 的 index 和 term 的哟。Service 可能就是从这拿到的 index 吧，虽然好像有点重复，但毕竟只有 Service 那边负责对 snapshot 的序列化/反序列化嘛，raft 这边解析不来。
+  > 这个图的意思并不是 snapshot 里包含 lastIncludedTerm 和 lastIncludedIndex，只是 raft 应该保存并持久化他们俩。snapshot 里只包含 service 层的数据。
   
   另外，Snapshot 只用于 ***server 上传一些 log 后，被通知一部分 log 已经生成快照，Service 指示 server 进行日志压缩***。从 crash 状态的恢复并不走这个函数。
   

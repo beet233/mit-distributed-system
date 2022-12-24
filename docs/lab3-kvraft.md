@@ -145,3 +145,99 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 凭的是每次都写入 raft log 并被 commit 了再执行，即使是一个简单的 get 也如此。当一个操作被 raft commit 了，这就能够保证，它前面的所有操作都将在这次操作之前执行完毕。比如一个 get，当比它更早的请求已经被处理完毕返回客户端时，这些请求一定已经在 raft log 中，所以 get 一定可以读到他们作用的结果。
 
 而再举个例子，一个 get（1号 get） 还没返回，另一个 get（2号 get） 又发出来了，可能出于种种原因，1号 get 要重试，而 2 号 get 不用，导致 1 号 get 可能拿到比 2 号 get 更新的值，而且它的 raft log 甚至可能在 2 号之前。然而，我们需要知道这是合理的，线性一致的。读请求是一个系统向外界提供观测的通道，当两个请求从发出到返回，有相互重合的时间段时，谁读到更新的数据都是合理的，都是可能满足线性一致性的。是不是真的满足线性一致性，只有：当某些请求已经返回给客户端了，他们的结果已经被观测到了，那在他们返回之后发出的请求，一定要也能够观测到前面这些请求的影响。
+
+## Part 3B - Key/value service with snapshots
+
+在 part 3A 的基础上，把 raft 里已经实现了的 snapshot 机制用起来。
+
+### Main Idea
+
+#### Basic Implement
+
+这里问题的核心就在于，raft 的日志长久下来会变得非常巨大，而且都是 log 恢复起来也不方便。我们需要用 `snapshot` 来做 `checkpoint`，在日志达到一定程度时，保存当前状态机的快照并把前面的日志删除。
+
+> 记得区分清楚 persist 和 snapshot 的不同目的：persist 是为了持久化，崩溃而不丢失。snapshot 是为了保存快照，削减日志量。当然，snapshot 本身也是持久化的。
+
+大致流程如下：
+
++ 每个 server 根据 raft log size 独立判断 snapshot 的时机。
++ server 将自己的 service 相关数据序列化，交给 raft 的 Snapshot 函数。
++ raft 削减日志，并将自己的 state 和 service 层的序列化数据一起交给 persister 持久化。
+
+每当崩坏/其他领先的 raft replica 传来快照时，server 的 raft 将更新日志和持久化的快照，并把快照放在 applyMsg 里一起传给 service 层。service 层若察觉到这个快照比当前的状态机还要新，那么更新状态机。
+
+#### What to Snapshot
+
+我们需要用快照保存哪些量呢？
+
+注意到，即使有了快照，线性一致性和防止重复执行同一条指令都不能丢。所以记录已经执行的指令还是有必要的。这里除了 kv map 以外，我还序列化了 latestAppliedRaftIndex（在 applyLoop 中更新），latestAppliedRequest，前者记录目前执行的进度，后者记录各个 client 已经执行掉的 request。
+
+```go
+func (kv *KVServer) serialize() []byte {
+   DPrintf("server %d serialize to a snapshot\n", kv.me)
+   kv.mu.Lock()
+   defer kv.mu.Unlock()
+   w := new(bytes.Buffer)
+   e := labgob.NewEncoder(w)
+   e.Encode(kv.latestAppliedRaftIndex)
+   e.Encode(kv.storage)
+   e.Encode(kv.latestAppliedRequest)
+   data := w.Bytes()
+   return data
+}
+
+func (kv *KVServer) deserialize(snapshot []byte) {
+   kv.mu.Lock()
+   defer kv.mu.Unlock()
+   if snapshot == nil || len(snapshot) < 1 {
+      DPrintf("server %d has no snapshot to recover\n", kv.me)
+      return
+   }
+
+   DPrintf("server %d read persister to recover\n", kv.me)
+
+   r := bytes.NewBuffer(snapshot)
+   d := labgob.NewDecoder(r)
+
+   var persistLatestAppliedRaftIndex int
+   var persistStorage map[string]string
+   var persistLatestAppliedRequest map[int64]int
+
+   if d.Decode(&persistLatestAppliedRaftIndex) != nil || d.Decode(&persistStorage) != nil || d.Decode(&persistLatestAppliedRequest) != nil {
+      DPrintf("server %d read persister error\n", kv.me)
+   } else {
+      kv.latestAppliedRaftIndex = persistLatestAppliedRaftIndex
+      kv.storage = persistStorage
+      kv.latestAppliedRequest = persistLatestAppliedRequest
+   }
+}
+```
+
+#### When to Snapshot
+
+每次 apply 一条后，便可以检查一下 raft 的 size，如果超标了就 snapshot。
+
+#### Get Snapshot from Others / Recover from Crash
+
+从 applyCh 里收到快照的话，是别的 raft replica 领先太多，所以把快照发给我。
+
+```go
+// 如果快照比状态机还新，那直接更新到快照。
+// 如果快照比当前快照新，那其实 raft 那边在传过来前就已经切割完了 log 并存好了 raft state 和 service 的 snapshot，这边不用干。
+if applyMsg.SnapshotIndex > kv.latestAppliedRaftIndex {
+   DPrintf("server %d get snapshot newer than state machine\n", kv.me)
+   kv.deserialize(applyMsg.Snapshot)
+   // kv.latestAppliedRaftIndex = applyMsg.SnapshotIndex
+}
+```
+
+启动时恢复：
+
+```go
+kv.persister = persister
+kv.storage = make(map[string]string)
+kv.waitChs = make(map[int]chan WaitChResponse)
+kv.latestAppliedRequest = make(map[int64]int)
+snapshot := persister.ReadSnapshot()
+kv.deserialize(snapshot)
+```
