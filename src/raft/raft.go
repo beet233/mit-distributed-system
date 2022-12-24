@@ -272,6 +272,7 @@ func (rf *Raft) getLogs(start int, end int) []LogEntry {
 		log.Fatalf("getLogs: server %d getLogs end %d overflow\n", rf.me, end)
 	}
 	if start <= rf.lastIncludedIndex {
+		debug.PrintStack()
 		log.Fatalf("getLogs: server %d has save log %d to snapshot\n", rf.me, start)
 	}
 	return rf.log[start-rf.lastIncludedIndex : end-rf.lastIncludedIndex]
@@ -559,7 +560,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if tempIndex == 0 {
 				log.Fatalf("ERROR: log[0]'s term conflict???\n")
 			}
-			for tempIndex > 1 && rf.getTermOfLog(tempIndex) == conflictTerm {
+			for tempIndex > 1 && tempIndex >= rf.lastIncludedIndex && rf.getTermOfLog(tempIndex) == conflictTerm {
 				tempIndex -= 1
 			}
 			reply.NextRetryStartIndex = tempIndex
@@ -1375,6 +1376,11 @@ func (rf *Raft) applyLoop() {
 			nextApplied := rf.lastApplied + 1
 			rf.logMutex.RLock()
 			rf.commitMutex.RLock()
+			if rf.lastIncludedIndex > nextApplied {
+				rf.commitMutex.RUnlock()
+				rf.logMutex.RUnlock()
+				continue
+			}
 			toBeApplied := rf.getLogs(nextApplied, rf.commitIndex+1)
 			rf.commitMutex.RUnlock()
 			rf.logMutex.RUnlock()

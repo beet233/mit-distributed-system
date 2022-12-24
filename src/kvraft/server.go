@@ -4,6 +4,7 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
@@ -60,10 +61,12 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	storage map[string]string
+	storage   map[string]string
+	persister *raft.Persister
 	// raft log index -> wait channel
-	waitChs              map[int]chan WaitChResponse
-	latestAppliedRequest map[int64]int // clientId -> requestId
+	waitChs                map[int]chan WaitChResponse
+	latestAppliedRequest   map[int64]int // clientId -> requestId
+	latestAppliedRaftIndex int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -176,6 +179,10 @@ func (kv *KVServer) applyLoop() {
 	for {
 		applyMsg := <-kv.applyCh
 		if applyMsg.CommandValid {
+			if applyMsg.CommandIndex <= kv.latestAppliedRaftIndex {
+				DPrintf("server %d get older command from applyCh\n", kv.me)
+				continue
+			}
 			op := applyMsg.Command.(Op)
 			waitChResponse := WaitChResponse{op: op}
 			// 需要注意处理重复的请求
@@ -234,6 +241,11 @@ func (kv *KVServer) applyLoop() {
 				kv.mu.Unlock()
 				waitChResponse.err = OK
 			}
+			kv.latestAppliedRaftIndex = applyMsg.CommandIndex
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+				// 序列化 storage 和 latestAppliedRequest，调用 rf.Snapshot
+				kv.rf.Snapshot(applyMsg.CommandIndex, kv.serialize())
+			}
 			// 如果返回了，却找不到这个 waitCh 了，那说明超时被放弃了，直接不传就行，下次遇到同样的就不执行
 			kv.mu.Lock()
 			waitCh, exist := kv.waitChs[applyMsg.CommandIndex]
@@ -243,9 +255,56 @@ func (kv *KVServer) applyLoop() {
 			if exist {
 				waitCh <- waitChResponse
 			} else {
-				//DPrintf("server %d found no waitCh for raftIndex %d\n", kv.me, applyMsg.CommandIndex)
+				// DPrintf("server %d found no waitCh for raftIndex %d\n", kv.me, applyMsg.CommandIndex)
+			}
+		} else {
+			// 如果快照比状态机还新，那直接更新到快照。
+			// 如果快照比当前快照新，那其实 raft 那边在传过来前就已经切割完了 log 并存好了 raft state 和 service 的 snapshot，这边不用干。
+			if applyMsg.SnapshotIndex > kv.latestAppliedRaftIndex {
+				DPrintf("server %d get snapshot newer than state machine\n", kv.me)
+				kv.deserialize(applyMsg.Snapshot)
+				// kv.latestAppliedRaftIndex = applyMsg.SnapshotIndex
 			}
 		}
+	}
+}
+
+func (kv *KVServer) serialize() []byte {
+	DPrintf("server %d serialize to a snapshot\n", kv.me)
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.latestAppliedRaftIndex)
+	e.Encode(kv.storage)
+	e.Encode(kv.latestAppliedRequest)
+	data := w.Bytes()
+	return data
+}
+
+func (kv *KVServer) deserialize(snapshot []byte) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if snapshot == nil || len(snapshot) < 1 {
+		DPrintf("server %d has no snapshot to recover\n", kv.me)
+		return
+	}
+
+	DPrintf("server %d read persister to recover\n", kv.me)
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var persistLatestAppliedRaftIndex int
+	var persistStorage map[string]string
+	var persistLatestAppliedRequest map[int64]int
+
+	if d.Decode(&persistLatestAppliedRaftIndex) != nil || d.Decode(&persistStorage) != nil || d.Decode(&persistLatestAppliedRequest) != nil {
+		DPrintf("server %d read persister error\n", kv.me)
+	} else {
+		kv.latestAppliedRaftIndex = persistLatestAppliedRaftIndex
+		kv.storage = persistStorage
+		kv.latestAppliedRequest = persistLatestAppliedRequest
 	}
 }
 
@@ -278,10 +337,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-
+	kv.persister = persister
 	kv.storage = make(map[string]string)
 	kv.waitChs = make(map[int]chan WaitChResponse)
 	kv.latestAppliedRequest = make(map[int64]int)
+	snapshot := persister.ReadSnapshot()
+	kv.deserialize(snapshot)
 	go kv.applyLoop()
 	return kv
 }
