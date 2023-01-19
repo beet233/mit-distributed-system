@@ -138,6 +138,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 + 对于读请求，直接按最新的 kv 给它读。
 + 对于写请求，直接返回 OK 而不重复执行。
 
+判断是不是同一个请求的重发并不能放在 RPC Handler 的开头，因为很有可能上一次 RPC 还在执行，latestAppliedRequest 还没有更新，请求就有可能被重复执行。因为 applyLoop 是单线程串行执行所有 Op 的，所以只在 applyLoop 中更新以及比较 latestAppliedRequest 能够保证正确性。这也就是说，即使是重复的请求，也会进入 raft 的 log，只不过 applyLoop 在 apply 到状态机时会识别并特别地处理它。
+
+更新 latestAppliedRequest 也不能放在 RPC Handler 的结尾，而是要放在 applyLoop 内的 apply 到状态机之后。一方面是要保证更新和比较 latestAppliedLoop 的串行，另一方面是，kv 系统中只有 raft leader 才有 RPC handling 过程，其他的 follower 只有 applyLoop 在运行，他们也需要保证进入 raft log 的重复的请求不执行。
+
 #### Linearizability
 
 这样做下来，凭什么是线性一致的呢？
