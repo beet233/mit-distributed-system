@@ -67,10 +67,8 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
 	raftIndex, _, isLeader := sc.rf.Start(Op{Type: JOIN, JoinArgs: *args})
 	if !isLeader {
-		// TODO: 考虑 reply 的 Err 除了 OK 还有没有别的需求
-		reply.WrongLeader = true
+		reply.Err = ErrWrongLeader
 	} else {
-		reply.WrongLeader = false
 		sc.mu.Lock()
 		waitCh, exist := sc.waitChs[raftIndex]
 		if exist {
@@ -81,9 +79,8 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 		sc.mu.Unlock()
 		select {
 		case <-time.After(time.Millisecond * TimeOut):
-			reply.WrongLeader = true
+			reply.Err = ErrWrongLeader
 		case response := <-waitCh:
-			// TODO: 似乎没什么事可做，err 有什么用吗？
 			reply.Err = response.err
 		}
 	}

@@ -44,12 +44,20 @@ func (ck *Clerk) Query(num int) Config {
 	defer ck.mu.Unlock()
 	args := &QueryArgs{Num: num, ClientId: ck.clientId, RequestId: ck.requestId}
 	for {
+		// try lastLeader first
+		var reply QueryReply
+		ok := ck.servers[ck.lastLeader].Call("ShardCtrler.Query", args, &reply)
+		if ok && reply.Err == OK {
+			ck.requestId += 1
+			return reply.Config
+		}
 		// try each known server.
-		for _, srv := range ck.servers {
+		for index, srv := range ck.servers {
 			var reply QueryReply
 			ok := srv.Call("ShardCtrler.Query", args, &reply)
-			if ok && reply.WrongLeader == false {
+			if ok && reply.Err == OK {
 				ck.requestId += 1
+				ck.lastLeader = index
 				return reply.Config
 			}
 		}
@@ -62,12 +70,20 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	defer ck.mu.Unlock()
 	args := &JoinArgs{Servers: servers, ClientId: ck.clientId, RequestId: ck.requestId}
 	for {
+		// try lastLeader first
+		var reply JoinReply
+		ok := ck.servers[ck.lastLeader].Call("ShardCtrler.Join", args, &reply)
+		if ok && reply.Err == OK {
+			ck.requestId += 1
+			return
+		}
 		// try each known server.
-		for _, srv := range ck.servers {
+		for index, srv := range ck.servers {
 			var reply JoinReply
 			ok := srv.Call("ShardCtrler.Join", args, &reply)
-			if ok && reply.WrongLeader == false {
+			if ok && reply.Err == OK {
 				ck.requestId += 1
+				ck.lastLeader = index
 				return
 			}
 		}
@@ -80,12 +96,20 @@ func (ck *Clerk) Leave(gids []int) {
 	defer ck.mu.Unlock()
 	args := &LeaveArgs{GIDs: gids, ClientId: ck.clientId, RequestId: ck.requestId}
 	for {
+		// try lastLeader first
+		var reply LeaveReply
+		ok := ck.servers[ck.lastLeader].Call("ShardCtrler.Leave", args, &reply)
+		if ok && reply.Err == OK {
+			ck.requestId += 1
+			return
+		}
 		// try each known server.
-		for _, srv := range ck.servers {
+		for index, srv := range ck.servers {
 			var reply LeaveReply
 			ok := srv.Call("ShardCtrler.Leave", args, &reply)
-			if ok && reply.WrongLeader == false {
+			if ok && reply.Err == OK {
 				ck.requestId += 1
+				ck.lastLeader = index
 				return
 			}
 		}
@@ -98,12 +122,20 @@ func (ck *Clerk) Move(shard int, gid int) {
 	defer ck.mu.Unlock()
 	args := &MoveArgs{Shard: shard, GID: gid, ClientId: ck.clientId, RequestId: ck.requestId}
 	for {
+		// try lastLeader first
+		var reply MoveReply
+		ok := ck.servers[ck.lastLeader].Call("ShardCtrler.Move", args, &reply)
+		if ok && reply.Err == OK {
+			ck.requestId += 1
+			return
+		}
 		// try each known server.
-		for _, srv := range ck.servers {
+		for index, srv := range ck.servers {
 			var reply MoveReply
 			ok := srv.Call("ShardCtrler.Move", args, &reply)
-			if ok && reply.WrongLeader == false {
+			if ok && reply.Err == OK {
 				ck.requestId += 1
+				ck.lastLeader = index
 				return
 			}
 		}
