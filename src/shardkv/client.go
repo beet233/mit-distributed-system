@@ -8,7 +8,10 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"github.com/sasha-s/go-deadlock"
+)
 import "crypto/rand"
 import "math/big"
 import "6.824/shardctrler"
@@ -36,10 +39,15 @@ func nrand() int64 {
 }
 
 type Clerk struct {
+	// 注意，这个 sm 是用来访问 shardctrler 的 Clerk，并不是这里的 Clerk
 	sm       *shardctrler.Clerk
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	// 这次不存 lastLeader 了，因为有好多 group 和 raft leader，太麻烦
+	clientId  int64          // nrand 唯一确定（总共没几个 client，足矣）
+	requestId int            // 从 0 递增
+	mu        deadlock.Mutex // 单走一把锁
 }
 
 //
@@ -56,6 +64,8 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.clientId = nrand()
+	ck.requestId = 0
 	return ck
 }
 
@@ -66,8 +76,13 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
 	args := GetArgs{}
 	args.Key = key
+	args.ClientId = ck.clientId
+	args.RequestId = ck.requestId
 
 	for {
 		shard := key2shard(key)
@@ -79,6 +94,7 @@ func (ck *Clerk) Get(key string) string {
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					ck.requestId += 1
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -100,11 +116,15 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
 	args := PutAppendArgs{}
 	args.Key = key
 	args.Value = value
 	args.Op = op
-
+	args.ClientId = ck.clientId
+	args.RequestId = ck.requestId
 
 	for {
 		shard := key2shard(key)
@@ -115,6 +135,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
+					ck.requestId += 1
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
