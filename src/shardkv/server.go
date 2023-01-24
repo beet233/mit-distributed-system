@@ -3,6 +3,8 @@ package shardkv
 import (
 	"6.824/labrpc"
 	"6.824/shardctrler"
+	"bytes"
+	"fmt"
 	"github.com/sasha-s/go-deadlock"
 	"log"
 	"time"
@@ -10,7 +12,19 @@ import (
 import "6.824/raft"
 import "6.824/labgob"
 
-const FETCH_CONFIG_INTERVAL = 100
+const FetchConfigInterval = 100
+
+const RaftTimeOut = 200
+
+const Debug = true
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		rightHalf := fmt.Sprintf(format, a...)
+		log.Printf("shardkv | %s", rightHalf)
+	}
+	return
+}
 
 const (
 	GET    = 0
@@ -55,7 +69,7 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	shards     map[int]Shard
+	shards     map[int]*Shard
 	prevConfig shardctrler.Config
 	currConfig shardctrler.Config
 	persister  *raft.Persister
@@ -79,6 +93,52 @@ const (
 	WAITING = 3 // 等待之前的 group 删除
 )
 
+func (kv *ShardKV) serialize() []byte {
+	DPrintf("server %d serialize to a snapshot\n", kv.me)
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.latestAppliedRaftIndex)
+	e.Encode(kv.latestAppliedRequest)
+	e.Encode(kv.prevConfig)
+	e.Encode(kv.currConfig)
+	e.Encode(kv.shards)
+	data := w.Bytes()
+	return data
+}
+
+func (kv *ShardKV) deserialize(snapshot []byte) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if snapshot == nil || len(snapshot) < 1 {
+		DPrintf("server %d has no snapshot to recover\n", kv.me)
+		return
+	}
+
+	DPrintf("server %d read persister to recover\n", kv.me)
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var persistLatestAppliedRaftIndex int
+	var persistLatestAppliedRequest map[int64]int
+	var persistPrevConfig shardctrler.Config
+	var persistCurrConfig shardctrler.Config
+	var persistShards map[int]*Shard
+
+	if d.Decode(&persistLatestAppliedRaftIndex) != nil || d.Decode(&persistLatestAppliedRequest) != nil ||
+		d.Decode(&persistPrevConfig) != nil || d.Decode(&persistCurrConfig) != nil || d.Decode(&persistShards) != nil {
+		DPrintf("server %d read persister error\n", kv.me)
+	} else {
+		kv.latestAppliedRaftIndex = persistLatestAppliedRaftIndex
+		kv.latestAppliedRequest = persistLatestAppliedRequest
+		kv.prevConfig = persistPrevConfig
+		kv.currConfig = persistCurrConfig
+		kv.shards = persistShards
+	}
+}
+
 type WaitChResponse struct {
 	err   Err
 	value string // for Get
@@ -86,10 +146,68 @@ type WaitChResponse struct {
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	raftIndex, _, isLeader := kv.rf.Start(Op{Type: GET, Key: args.Key, ClientId: args.ClientId, RequestId: args.RequestId})
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+	} else {
+		// 因为这个 Get 是个 RPC Handler，是要返回 reply 的，所以要等到 applyCh 传回关于这条指令的 msg 才行，建立以下通信机制
+		kv.mu.Lock()
+		waitCh, exist := kv.waitChs[raftIndex]
+		if exist {
+			log.Fatalf("shardkv | server %d try to get a existing waitCh\n", kv.me)
+		}
+		kv.waitChs[raftIndex] = make(chan WaitChResponse, 1)
+		waitCh = kv.waitChs[raftIndex]
+		kv.mu.Unlock()
+		// 选择在 server 端来判断超时，如果超时了还没返回，共识失败，认为 ErrWrongLeader
+		select {
+		case <-time.After(time.Millisecond * RaftTimeOut):
+			DPrintf("server %d timeout when handling Get\n", kv.me)
+			reply.Err = ErrWrongLeader
+		case response := <-waitCh:
+			reply.Value = response.value
+			reply.Err = response.err
+		}
+		// 用完后把 waitCh 删掉
+		kv.mu.Lock()
+		delete(kv.waitChs, raftIndex)
+		kv.mu.Unlock()
+	}
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	var opType OpType
+	if args.Op == "Put" {
+		opType = PUT
+	} else {
+		opType = APPEND
+	}
+	raftIndex, _, isLeader := kv.rf.Start(Op{Type: opType, Key: args.Key, Value: args.Value, ClientId: args.ClientId, RequestId: args.RequestId})
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+	} else {
+		kv.mu.Lock()
+		waitCh, exist := kv.waitChs[raftIndex]
+		if exist {
+			log.Fatalf("shardkv | server %d try to get a existing waitCh\n", kv.me)
+		}
+		kv.waitChs[raftIndex] = make(chan WaitChResponse, 1)
+		waitCh = kv.waitChs[raftIndex]
+		kv.mu.Unlock()
+		// 选择在 server 端来判断超时，如果超时了还没返回，共识失败，认为 ErrWrongLeader
+		select {
+		case <-time.After(time.Millisecond * RaftTimeOut):
+			DPrintf("server %d timeout when handling PutAppend\n", kv.me)
+			reply.Err = ErrWrongLeader
+		case response := <-waitCh:
+			reply.Err = response.err
+		}
+		// 用完后把 waitCh 删掉
+		kv.mu.Lock()
+		delete(kv.waitChs, raftIndex)
+		kv.mu.Unlock()
+	}
 }
 
 //
@@ -104,7 +222,123 @@ func (kv *ShardKV) Kill() {
 }
 
 func (kv *ShardKV) applyLoop() {
+	for {
+		applyMsg := <-kv.applyCh
+		if applyMsg.CommandValid {
+			if applyMsg.CommandIndex <= kv.latestAppliedRaftIndex {
+				DPrintf("server %d get older command from applyCh\n", kv.me)
+				continue
+			}
+			op := applyMsg.Command.(Op)
+			waitChResponse := WaitChResponse{}
+			// 需要注意处理重复的请求
+			switch op.Type {
+			case GET:
+				kv.mu.Lock()
+				// 对于读请求，要保证线性一致性，其实只要共识达成了就行，保证（在读请求发出前就完成的操作都被读到）
+				// 在读请求返回前，如果因为发生了问题而间隔较长，返回的内容其实是灵活的，在满足线性一致性的前提下取决于实现
+				// 我感觉读请求不需要做额外处理，如果是一次重试，那还是直接读现在的
+				shard, shardExist := kv.shards[key2shard(op.Key)]
+				// 如果 shard 不存在或者 shard 是 WORKING / WAITING 以外的状态，那么返回 ErrWrongGroup，让 client 重试
+				if !shardExist || (shard.status != WORKING && shard.status != WAITING) {
+					waitChResponse.err = ErrWrongGroup
+				} else {
+					_, exist := kv.latestAppliedRequest[op.ClientId]
+					if !exist {
+						kv.latestAppliedRequest[op.ClientId] = -1
+					}
+					if op.RequestId > kv.latestAppliedRequest[op.ClientId] {
+						kv.latestAppliedRequest[op.ClientId] = op.RequestId
+					}
+					value, keyExist := shard.storage[op.Key]
+					if !keyExist {
+						waitChResponse.err = ErrNoKey
+					} else {
+						waitChResponse.err = OK
+						waitChResponse.value = value
+					}
+				}
+				kv.mu.Unlock()
+			case PUT:
+				kv.mu.Lock()
+				DPrintf("server %d put key: %s, value: %s\n", kv.me, op.Key, op.Value)
+				shard, shardExist := kv.shards[key2shard(op.Key)]
+				// 如果 shard 不存在或者 shard 是 WORKING / WAITING 以外的状态，那么返回 ErrWrongGroup，让 client 重试
+				if !shardExist || (shard.status != WORKING && shard.status != WAITING) {
+					waitChResponse.err = ErrWrongGroup
+				} else {
+					_, exist := kv.latestAppliedRequest[op.ClientId]
+					if !exist {
+						kv.latestAppliedRequest[op.ClientId] = -1
+					}
+					if op.RequestId > kv.latestAppliedRequest[op.ClientId] {
+						kv.latestAppliedRequest[op.ClientId] = op.RequestId
+						shard.storage[op.Key] = op.Value
+					}
+					// 如果是重复的请求，就不做实际操作了，返回 OK 就行
+					waitChResponse.err = OK
+				}
+				kv.mu.Unlock()
+			case APPEND:
+				kv.mu.Lock()
+				DPrintf("server %d append key: %s, value: %s\n", kv.me, op.Key, op.Value)
+				shard, shardExist := kv.shards[key2shard(op.Key)]
+				// 如果 shard 不存在或者 shard 是 WORKING / WAITING 以外的状态，那么返回 ErrWrongGroup，让 client 重试
+				if !shardExist || (shard.status != WORKING && shard.status != WAITING) {
+					waitChResponse.err = ErrWrongGroup
+				} else {
+					_, exist := kv.latestAppliedRequest[op.ClientId]
+					if !exist {
+						kv.latestAppliedRequest[op.ClientId] = -1
+					}
+					if op.RequestId > kv.latestAppliedRequest[op.ClientId] {
+						kv.latestAppliedRequest[op.ClientId] = op.RequestId
+						value, keyExist := shard.storage[op.Key]
+						if keyExist {
+							shard.storage[op.Key] = value + op.Value
+						} else {
+							shard.storage[op.Key] = op.Value
+						}
+					}
+					// 如果是重复的请求，就不做实际操作了，返回 OK 就行
+					waitChResponse.err = OK
+				}
+				kv.mu.Unlock()
+			case UPDATE_CONFIG:
 
+			case PULL_SHARD:
+
+			case LEAVE_SHARD:
+
+			case TRANSFER_DONE:
+
+			}
+			kv.latestAppliedRaftIndex = applyMsg.CommandIndex
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+				// 序列化 storage 和 latestAppliedRequest，调用 rf.Snapshot
+				kv.rf.Snapshot(applyMsg.CommandIndex, kv.serialize())
+			}
+			// 如果返回了，却找不到这个 waitCh 了，那说明超时被放弃了，直接不传就行，下次遇到同样的就不执行
+			kv.mu.RLock()
+			waitCh, exist := kv.waitChs[applyMsg.CommandIndex]
+			kv.mu.RUnlock()
+			// 注意，其实只有 leader 有 waitCh，别的 follower 虽然也不断从 applyCh 里接收，但是是没有 waitCh 的
+			// 同理，follower 们的 apply 到 storage 的过程实质上要在 applyLoop 进行
+			if exist {
+				waitCh <- waitChResponse
+			} else {
+				// DPrintf("server %d found no waitCh for raftIndex %d\n", kv.me, applyMsg.CommandIndex)
+			}
+		} else {
+			// 如果快照比状态机还新，那直接更新到快照。
+			// 如果快照比当前快照新，那其实 raft 那边在传过来前就已经切割完了 log 并存好了 raft state 和 service 的 snapshot，这边不用干。
+			if applyMsg.SnapshotIndex > kv.latestAppliedRaftIndex {
+				DPrintf("server %d get snapshot newer than state machine\n", kv.me)
+				kv.deserialize(applyMsg.Snapshot)
+				// kv.latestAppliedRaftIndex = applyMsg.SnapshotIndex
+			}
+		}
+	}
 }
 
 func (kv *ShardKV) fetchNextConfig() {
@@ -131,7 +365,7 @@ func (kv *ShardKV) fetchNextConfig() {
 			}
 		}
 		kv.mu.Unlock()
-		time.Sleep(time.Millisecond * FETCH_CONFIG_INTERVAL)
+		time.Sleep(time.Millisecond * FetchConfigInterval)
 	}
 }
 
@@ -177,7 +411,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	// Your initialization code here.
 	kv.ctrlerClerk = shardctrler.MakeClerk(ctrlers)
-	kv.shards = make(map[int]Shard)
+	kv.shards = make(map[int]*Shard)
 	// 初始化为和 shardctrler 一模一样的 invalid config 0
 	kv.currConfig = shardctrler.Config{Groups: map[int][]string{}}
 	kv.prevConfig = kv.currConfig
@@ -188,6 +422,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	
+	snapshot := persister.ReadSnapshot()
+	kv.deserialize(snapshot)
 
 	go kv.fetchNextConfig()
 	go kv.applyLoop()
