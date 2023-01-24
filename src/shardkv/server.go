@@ -12,7 +12,11 @@ import (
 import "6.824/raft"
 import "6.824/labgob"
 
+// lab 说明给的建议轮询间隔
 const FetchConfigInterval = 100
+
+// 设定得和 raft time out 时间大致一样，有效等待 raft apply 完成
+const RetryPullInterval = 200
 
 const RaftTimeOut = 200
 
@@ -52,8 +56,9 @@ type Op struct {
 	// for UPDATE_CONFIG
 	Config shardctrler.Config
 	// for PULL_SHARD, LEAVE_SHARD, TRANSFER_DONE
-	ShardId int
-	Storage map[string]string
+	ShardId       int
+	ConfigVersion int
+	Storage       map[string]string
 }
 
 type ShardKV struct {
@@ -305,7 +310,43 @@ func (kv *ShardKV) applyLoop() {
 				}
 				kv.mu.Unlock()
 			case UPDATE_CONFIG:
-
+				kv.mu.Lock()
+				kv.prevConfig = kv.currConfig
+				kv.currConfig = op.Config
+				if op.Config.Num == 1 {
+					// 第一份配置，直接创建空 map 开始 WORKING
+					for shardId, gid := range op.Config.Shards {
+						if gid == kv.gid {
+							kv.shards[shardId] = &Shard{
+								storage: map[string]string{},
+								status:  WORKING,
+							}
+						}
+					}
+				} else {
+					// 更新各个 shard 状态，pull 发起任务
+					for shardId, gid := range op.Config.Shards {
+						if gid == kv.gid {
+							_, exist := kv.shards[shardId]
+							// 如果是当前没有的，那么需要 PULL
+							if !exist {
+								kv.shards[shardId] = &Shard{
+									storage: nil,
+									status:  PULLING,
+								}
+								// TODO: 所有人发起 pull 任务（其实只有 leader 会实际执行），拿到数据后 raft 分享给 follower
+								// 因为这里是上锁的，所以不能久留，pull 任务另 go 一个线程去做
+							}
+						}
+					}
+					for shardId, _ := range kv.shards {
+						// 如果我现在的 shard 中，有 shard 在新 config 里不属于我，那么需要 LEAVE
+						if op.Config.Shards[shardId] != kv.gid {
+							kv.shards[shardId].status = LEAVING
+						}
+					}
+				}
+				kv.mu.Unlock()
 			case PULL_SHARD:
 
 			case LEAVE_SHARD:
@@ -341,30 +382,57 @@ func (kv *ShardKV) applyLoop() {
 	}
 }
 
-func (kv *ShardKV) fetchNextConfig() {
+func (kv *ShardKV) pullShard(shardId int) {
 	for {
 		kv.mu.Lock()
-		readForNext := true
-		for _, shard := range kv.shards {
-			if shard.status != WORKING {
-				readForNext = false
-			}
+		if kv.shards[shardId].status != PULLING {
+			kv.mu.Unlock()
+			break
 		}
-		if readForNext {
-			currVersion := kv.currConfig.Num
-			latestConfig := kv.ctrlerClerk.Query(currVersion + 1)
-			if latestConfig.Num > currVersion {
-				if latestConfig.Num != currVersion+1 {
-					log.Fatalln("Jump through some versions!")
-				}
-				// TODO: 更新 config 并标记各个 shard 状态，用 raft.Start 进 applyLoop 完成
-				// kv.currConfig = latestConfig
-				// if kv.currConfig.Num == 1 {
-				// } else {
-				// }
-			}
+		_, isLeader := kv.rf.GetState()
+		if isLeader {
+			// TODO: 发送 rpc 请求数据片，raft start 分享。注意这里也得循环 raft server 找 leader，并且需要从 prevConfig 找 group
 		}
 		kv.mu.Unlock()
+		time.Sleep(time.Millisecond * RetryPullInterval)
+	}
+}
+
+// 向老主人发送 Leave RPC，若 OK 则表示老主人已经 LEAVING -> nil，这边即可 Start 一个 TRANSFER_DONE，让 WAITING -> WORKING
+func (kv *ShardKV) sendLeave(shardId int) {
+
+}
+
+// 每间隔 FetchConfigInterval 抓取一次 config，由 raft leader 来做
+func (kv *ShardKV) fetchNextConfig() {
+	for {
+		_, isLeader := kv.rf.GetState()
+		if isLeader {
+			kv.mu.Lock()
+			readForNext := true
+			for _, shard := range kv.shards {
+				if shard.status != WORKING {
+					readForNext = false
+				}
+			}
+			if readForNext {
+				currVersion := kv.currConfig.Num
+				latestConfig := kv.ctrlerClerk.Query(currVersion + 1)
+				if latestConfig.Num > currVersion {
+					if latestConfig.Num != currVersion+1 {
+						log.Fatalln("Jump through some versions!")
+					}
+					// 更新 config 并标记各个 shard 状态，用 raft.Start 进 applyLoop 完成
+					// 这边没有什么 waitCh 来通知是否完成，如果没更新成功自然会重试
+					kv.rf.Start(Op{Type: UPDATE_CONFIG, Config: latestConfig})
+					// kv.currConfig = latestConfig
+					// if kv.currConfig.Num == 1 {
+					// } else {
+					// }
+				}
+			}
+			kv.mu.Unlock()
+		}
 		time.Sleep(time.Millisecond * FetchConfigInterval)
 	}
 }
@@ -422,7 +490,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	
+
 	snapshot := persister.ReadSnapshot()
 	kv.deserialize(snapshot)
 

@@ -10,10 +10,11 @@ package shardkv
 //
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK                    = "OK"
+	ErrNoKey              = "ErrNoKey"
+	ErrWrongGroup         = "ErrWrongGroup"
+	ErrWrongLeader        = "ErrWrongLeader"
+	ErrLowerConfigVersion = "ErrLowerConfigVersion" // 只有当被调用 RPC 方这边版本更低时返回，若更高则直接返回 OK 即可
 )
 
 type Err string
