@@ -43,6 +43,8 @@ func (ck *Clerk) Query(num int) Config {
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
 	args := &QueryArgs{Num: num, ClientId: ck.clientId, RequestId: ck.requestId}
+	retryTime := 0
+	retryMaxTime := 5
 	for {
 		// try lastLeader first
 		var reply QueryReply
@@ -60,6 +62,10 @@ func (ck *Clerk) Query(num int) Config {
 				ck.lastLeader = index
 				return reply.Config
 			}
+		}
+		retryTime += 1
+		if retryTime == retryMaxTime {
+			return Config{}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

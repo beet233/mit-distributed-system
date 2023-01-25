@@ -18,14 +18,16 @@ const FetchConfigInterval = 100
 // 设定得和 raft time out 时间大致一样，有效等待 raft apply 完成
 const RetryPullInterval = 200
 
+const RetryLeaveInterval = 200
+
 const RaftTimeOut = 200
 
 const Debug = true
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
+func (kv *ShardKV) DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
 		rightHalf := fmt.Sprintf(format, a...)
-		log.Printf("shardkv | %s", rightHalf)
+		log.Printf("shardkv gid: %v | %s", kv.gid, rightHalf)
 	}
 	return
 }
@@ -85,8 +87,8 @@ type ShardKV struct {
 }
 
 type Shard struct {
-	storage map[string]string
-	status  ShardStatus
+	Storage map[string]string
+	Status  ShardStatus
 }
 
 type ShardStatus int
@@ -99,7 +101,7 @@ const (
 )
 
 func (kv *ShardKV) serialize() []byte {
-	DPrintf("server %d serialize to a snapshot\n", kv.me)
+	kv.DPrintf("server %d serialize to a snapshot\n", kv.me)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	w := new(bytes.Buffer)
@@ -108,6 +110,14 @@ func (kv *ShardKV) serialize() []byte {
 	e.Encode(kv.latestAppliedRequest)
 	e.Encode(kv.prevConfig)
 	e.Encode(kv.currConfig)
+	// shardIds := make([]int, 0)
+	// shards := make([]Shard, 0)
+	// for shardId, shard := range kv.shards {
+	// 	shardIds = append(shardIds, shardId)
+	// 	shards = append(shards, *shard)
+	// }
+	// e.Encode(shardIds)
+	// e.Encode(shards)
 	e.Encode(kv.shards)
 	data := w.Bytes()
 	return data
@@ -117,11 +127,11 @@ func (kv *ShardKV) deserialize(snapshot []byte) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	if snapshot == nil || len(snapshot) < 1 {
-		DPrintf("server %d has no snapshot to recover\n", kv.me)
+		kv.DPrintf("server %d has no snapshot to recover\n", kv.me)
 		return
 	}
 
-	DPrintf("server %d read persister to recover\n", kv.me)
+	kv.DPrintf("server %d read persister to recover\n", kv.me)
 
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
@@ -131,15 +141,21 @@ func (kv *ShardKV) deserialize(snapshot []byte) {
 	var persistPrevConfig shardctrler.Config
 	var persistCurrConfig shardctrler.Config
 	var persistShards map[int]*Shard
+	// var persistShardIds []int
+	// var persistShards []Shard
 
 	if d.Decode(&persistLatestAppliedRaftIndex) != nil || d.Decode(&persistLatestAppliedRequest) != nil ||
 		d.Decode(&persistPrevConfig) != nil || d.Decode(&persistCurrConfig) != nil || d.Decode(&persistShards) != nil {
-		DPrintf("server %d read persister error\n", kv.me)
+		log.Fatalf("gid %d server %d read persister error\n", kv.gid, kv.me)
 	} else {
 		kv.latestAppliedRaftIndex = persistLatestAppliedRaftIndex
 		kv.latestAppliedRequest = persistLatestAppliedRequest
 		kv.prevConfig = persistPrevConfig
 		kv.currConfig = persistCurrConfig
+		// kv.shards = map[int]*Shard{}
+		// for i := 0; i < len(persistShardIds); i++ {
+		// 	kv.shards[persistShardIds[i]] = &persistShards[i]
+		// }
 		kv.shards = persistShards
 	}
 }
@@ -167,7 +183,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		// 选择在 server 端来判断超时，如果超时了还没返回，共识失败，认为 ErrWrongLeader
 		select {
 		case <-time.After(time.Millisecond * RaftTimeOut):
-			DPrintf("server %d timeout when handling Get\n", kv.me)
+			kv.DPrintf("server %d timeout when handling Get\n", kv.me)
 			reply.Err = ErrWrongLeader
 		case response := <-waitCh:
 			reply.Value = response.value
@@ -203,7 +219,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		// 选择在 server 端来判断超时，如果超时了还没返回，共识失败，认为 ErrWrongLeader
 		select {
 		case <-time.After(time.Millisecond * RaftTimeOut):
-			DPrintf("server %d timeout when handling PutAppend\n", kv.me)
+			kv.DPrintf("server %d timeout when handling PutAppend\n", kv.me)
 			reply.Err = ErrWrongLeader
 		case response := <-waitCh:
 			reply.Err = response.err
@@ -231,7 +247,7 @@ func (kv *ShardKV) applyLoop() {
 		applyMsg := <-kv.applyCh
 		if applyMsg.CommandValid {
 			if applyMsg.CommandIndex <= kv.latestAppliedRaftIndex {
-				DPrintf("server %d get older command from applyCh\n", kv.me)
+				kv.DPrintf("server %d get older command from applyCh\n", kv.me)
 				continue
 			}
 			op := applyMsg.Command.(Op)
@@ -245,7 +261,7 @@ func (kv *ShardKV) applyLoop() {
 				// 我感觉读请求不需要做额外处理，如果是一次重试，那还是直接读现在的
 				shard, shardExist := kv.shards[key2shard(op.Key)]
 				// 如果 shard 不存在或者 shard 是 WORKING / WAITING 以外的状态，那么返回 ErrWrongGroup，让 client 重试
-				if !shardExist || (shard.status != WORKING && shard.status != WAITING) {
+				if !shardExist || (shard.Status != WORKING && shard.Status != WAITING) {
 					waitChResponse.err = ErrWrongGroup
 				} else {
 					_, exist := kv.latestAppliedRequest[op.ClientId]
@@ -255,7 +271,7 @@ func (kv *ShardKV) applyLoop() {
 					if op.RequestId > kv.latestAppliedRequest[op.ClientId] {
 						kv.latestAppliedRequest[op.ClientId] = op.RequestId
 					}
-					value, keyExist := shard.storage[op.Key]
+					value, keyExist := shard.Storage[op.Key]
 					if !keyExist {
 						waitChResponse.err = ErrNoKey
 					} else {
@@ -266,10 +282,10 @@ func (kv *ShardKV) applyLoop() {
 				kv.mu.Unlock()
 			case PUT:
 				kv.mu.Lock()
-				DPrintf("server %d put key: %s, value: %s\n", kv.me, op.Key, op.Value)
+				kv.DPrintf("server %d put key: %s, value: %s\n", kv.me, op.Key, op.Value)
 				shard, shardExist := kv.shards[key2shard(op.Key)]
 				// 如果 shard 不存在或者 shard 是 WORKING / WAITING 以外的状态，那么返回 ErrWrongGroup，让 client 重试
-				if !shardExist || (shard.status != WORKING && shard.status != WAITING) {
+				if !shardExist || (shard.Status != WORKING && shard.Status != WAITING) {
 					waitChResponse.err = ErrWrongGroup
 				} else {
 					_, exist := kv.latestAppliedRequest[op.ClientId]
@@ -278,7 +294,7 @@ func (kv *ShardKV) applyLoop() {
 					}
 					if op.RequestId > kv.latestAppliedRequest[op.ClientId] {
 						kv.latestAppliedRequest[op.ClientId] = op.RequestId
-						shard.storage[op.Key] = op.Value
+						shard.Storage[op.Key] = op.Value
 					}
 					// 如果是重复的请求，就不做实际操作了，返回 OK 就行
 					waitChResponse.err = OK
@@ -286,10 +302,10 @@ func (kv *ShardKV) applyLoop() {
 				kv.mu.Unlock()
 			case APPEND:
 				kv.mu.Lock()
-				DPrintf("server %d append key: %s, value: %s\n", kv.me, op.Key, op.Value)
+				kv.DPrintf("server %d append key: %s, value: %s\n", kv.me, op.Key, op.Value)
 				shard, shardExist := kv.shards[key2shard(op.Key)]
 				// 如果 shard 不存在或者 shard 是 WORKING / WAITING 以外的状态，那么返回 ErrWrongGroup，让 client 重试
-				if !shardExist || (shard.status != WORKING && shard.status != WAITING) {
+				if !shardExist || (shard.Status != WORKING && shard.Status != WAITING) {
 					waitChResponse.err = ErrWrongGroup
 				} else {
 					_, exist := kv.latestAppliedRequest[op.ClientId]
@@ -298,11 +314,11 @@ func (kv *ShardKV) applyLoop() {
 					}
 					if op.RequestId > kv.latestAppliedRequest[op.ClientId] {
 						kv.latestAppliedRequest[op.ClientId] = op.RequestId
-						value, keyExist := shard.storage[op.Key]
+						value, keyExist := shard.Storage[op.Key]
 						if keyExist {
-							shard.storage[op.Key] = value + op.Value
+							shard.Storage[op.Key] = value + op.Value
 						} else {
-							shard.storage[op.Key] = op.Value
+							shard.Storage[op.Key] = op.Value
 						}
 					}
 					// 如果是重复的请求，就不做实际操作了，返回 OK 就行
@@ -311,48 +327,82 @@ func (kv *ShardKV) applyLoop() {
 				kv.mu.Unlock()
 			case UPDATE_CONFIG:
 				kv.mu.Lock()
-				kv.prevConfig = kv.currConfig
-				kv.currConfig = op.Config
-				if op.Config.Num == 1 {
-					// 第一份配置，直接创建空 map 开始 WORKING
-					for shardId, gid := range op.Config.Shards {
-						if gid == kv.gid {
-							kv.shards[shardId] = &Shard{
-								storage: map[string]string{},
-								status:  WORKING,
-							}
-						}
-					}
-				} else {
-					// 更新各个 shard 状态，pull 发起任务
-					for shardId, gid := range op.Config.Shards {
-						if gid == kv.gid {
-							_, exist := kv.shards[shardId]
-							// 如果是当前没有的，那么需要 PULL
-							if !exist {
+				if kv.currConfig.Num == op.Config.Num-1 {
+					kv.prevConfig = kv.currConfig
+					kv.currConfig = op.Config
+					if op.Config.Num == 1 {
+						kv.DPrintf("create first config")
+						// 第一份配置，直接创建空 map 开始 WORKING
+						for shardId, gid := range op.Config.Shards {
+							if gid == kv.gid {
 								kv.shards[shardId] = &Shard{
-									storage: nil,
-									status:  PULLING,
+									Storage: map[string]string{},
+									Status:  WORKING,
 								}
-								// TODO: 所有人发起 pull 任务（其实只有 leader 会实际执行），拿到数据后 raft 分享给 follower
-								// 因为这里是上锁的，所以不能久留，pull 任务另 go 一个线程去做
 							}
 						}
-					}
-					for shardId, _ := range kv.shards {
-						// 如果我现在的 shard 中，有 shard 在新 config 里不属于我，那么需要 LEAVE
-						if op.Config.Shards[shardId] != kv.gid {
-							kv.shards[shardId].status = LEAVING
+					} else {
+						// 更新各个 shard 状态，pull 发起任务
+						kv.DPrintf("update shards status according to new config")
+						for shardId, gid := range op.Config.Shards {
+							if gid == kv.gid {
+								_, exist := kv.shards[shardId]
+								// 如果是当前没有的，那么需要 PULL
+								if !exist {
+									kv.shards[shardId] = &Shard{
+										Storage: nil,
+										Status:  PULLING,
+									}
+									// 所有人发起 pull 任务（其实只有 leader 会实际执行），拿到数据后 raft 分享给 follower
+									// 因为这里是上锁的，所以不能久留，pull 任务另 go 一个线程去做
+									go kv.pullShard(shardId, kv.currConfig.Num)
+								}
+							}
+						}
+						for shardId, _ := range kv.shards {
+							// 如果我现在的 shard 中，有 shard 在新 config 里不属于我，那么需要 LEAVE
+							if op.Config.Shards[shardId] != kv.gid {
+								kv.shards[shardId].Status = LEAVING
+							}
 						}
 					}
 				}
 				kv.mu.Unlock()
 			case PULL_SHARD:
-
+				kv.mu.Lock()
+				if kv.currConfig.Num == op.ConfigVersion {
+					if kv.shards[op.ShardId].Status == PULLING {
+						kv.DPrintf("get shard %v from ex-owner\n", op.ShardId)
+						kv.shards[op.ShardId].Storage = op.Storage
+						kv.shards[op.ShardId].Status = WAITING
+						go kv.sendLeave(op.ShardId, kv.currConfig.Num)
+					}
+				}
+				kv.mu.Unlock()
 			case LEAVE_SHARD:
-
+				kv.mu.Lock()
+				if kv.currConfig.Num == op.ConfigVersion {
+					_, exist := kv.shards[op.ShardId]
+					if exist {
+						kv.DPrintf("delete shard %v\n", op.ShardId)
+						delete(kv.shards, op.ShardId)
+					}
+					waitChResponse.err = OK
+				} else if kv.currConfig.Num > op.ConfigVersion {
+					waitChResponse.err = OK
+				} else {
+					waitChResponse.err = ErrConfigVersion
+				}
+				kv.mu.Unlock()
 			case TRANSFER_DONE:
-
+				kv.mu.Lock()
+				if kv.currConfig.Num == op.ConfigVersion {
+					if kv.shards[op.ShardId].Status == WAITING {
+						kv.DPrintf("confirm shard %v deleted from ex-owner\n", op.ShardId)
+						kv.shards[op.ShardId].Status = WORKING
+					}
+				}
+				kv.mu.Unlock()
 			}
 			kv.latestAppliedRaftIndex = applyMsg.CommandIndex
 			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
@@ -374,7 +424,7 @@ func (kv *ShardKV) applyLoop() {
 			// 如果快照比状态机还新，那直接更新到快照。
 			// 如果快照比当前快照新，那其实 raft 那边在传过来前就已经切割完了 log 并存好了 raft state 和 service 的 snapshot，这边不用干。
 			if applyMsg.SnapshotIndex > kv.latestAppliedRaftIndex {
-				DPrintf("server %d get snapshot newer than state machine\n", kv.me)
+				kv.DPrintf("server %d get snapshot newer than state machine\n", kv.me)
 				kv.deserialize(applyMsg.Snapshot)
 				// kv.latestAppliedRaftIndex = applyMsg.SnapshotIndex
 			}
@@ -382,25 +432,89 @@ func (kv *ShardKV) applyLoop() {
 	}
 }
 
-func (kv *ShardKV) pullShard(shardId int) {
+func (kv *ShardKV) pullShard(shardId int, configVersion int) {
 	for {
-		kv.mu.Lock()
-		if kv.shards[shardId].status != PULLING {
-			kv.mu.Unlock()
+		kv.mu.RLock()
+		if kv.currConfig.Num > configVersion {
+			kv.mu.RUnlock()
 			break
 		}
+		if kv.shards[shardId].Status != PULLING {
+			kv.mu.RUnlock()
+			break
+		}
+		// 注意，这里是 leader 发给 leader，任何一边不是 leader 都不对
 		_, isLeader := kv.rf.GetState()
 		if isLeader {
-			// TODO: 发送 rpc 请求数据片，raft start 分享。注意这里也得循环 raft server 找 leader，并且需要从 prevConfig 找 group
+			// 发送 rpc 请求数据片，raft start 分享。注意这里也得循环 raft server 找 leader，并且需要从 prevConfig 找 group
+			args := PullArgs{
+				ConfigVersion: configVersion,
+				ShardId:       shardId,
+			}
+			gid := kv.prevConfig.Shards[shardId]
+			if servers, ok := kv.prevConfig.Groups[gid]; ok {
+				// try each server for the shard.
+				for si := 0; si < len(servers); si++ {
+					srv := kv.make_end(servers[si])
+					var reply PullReply
+					ok := srv.Call("ShardKV.Pull", &args, &reply)
+					if ok && (reply.Err == OK) {
+						kv.rf.Start(Op{Type: PULL_SHARD, ShardId: shardId, ConfigVersion: configVersion, Storage: reply.Storage})
+						break
+					}
+					if ok && (reply.Err == ErrConfigVersion) {
+						break
+					}
+					// ... not ok, or ErrWrongLeader
+				}
+			}
 		}
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		time.Sleep(time.Millisecond * RetryPullInterval)
 	}
 }
 
 // 向老主人发送 Leave RPC，若 OK 则表示老主人已经 LEAVING -> nil，这边即可 Start 一个 TRANSFER_DONE，让 WAITING -> WORKING
-func (kv *ShardKV) sendLeave(shardId int) {
-
+func (kv *ShardKV) sendLeave(shardId int, configVersion int) {
+	for {
+		kv.mu.RLock()
+		if kv.currConfig.Num > configVersion {
+			kv.mu.RUnlock()
+			break
+		}
+		if kv.shards[shardId].Status != WAITING {
+			kv.mu.RUnlock()
+			break
+		}
+		// 注意，这里是 leader 发给 leader，任何一边不是 leader 都不对
+		_, isLeader := kv.rf.GetState()
+		if isLeader {
+			// 发送 rpc 请求删除数据片，raft start 分享。注意这里也得循环 raft server 找 leader，并且需要从 prevConfig 找 group
+			args := LeaveArgs{
+				ConfigVersion: configVersion,
+				ShardId:       shardId,
+			}
+			gid := kv.prevConfig.Shards[shardId]
+			if servers, ok := kv.prevConfig.Groups[gid]; ok {
+				// try each server for the shard.
+				for si := 0; si < len(servers); si++ {
+					srv := kv.make_end(servers[si])
+					var reply LeaveReply
+					ok := srv.Call("ShardKV.Leave", &args, &reply)
+					if ok && (reply.Err == OK) {
+						kv.rf.Start(Op{Type: TRANSFER_DONE, ShardId: shardId, ConfigVersion: configVersion})
+						break
+					}
+					if ok && (reply.Err == ErrConfigVersion) {
+						break
+					}
+					// ... not ok, or ErrWrongLeader
+				}
+			}
+		}
+		kv.mu.RUnlock()
+		time.Sleep(time.Millisecond * RetryLeaveInterval)
+	}
 }
 
 // 每间隔 FetchConfigInterval 抓取一次 config，由 raft leader 来做
@@ -408,10 +522,10 @@ func (kv *ShardKV) fetchNextConfig() {
 	for {
 		_, isLeader := kv.rf.GetState()
 		if isLeader {
-			kv.mu.Lock()
+			kv.mu.RLock()
 			readForNext := true
 			for _, shard := range kv.shards {
-				if shard.status != WORKING {
+				if shard.Status != WORKING {
 					readForNext = false
 				}
 			}
@@ -431,7 +545,7 @@ func (kv *ShardKV) fetchNextConfig() {
 					// }
 				}
 			}
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 		}
 		time.Sleep(time.Millisecond * FetchConfigInterval)
 	}
